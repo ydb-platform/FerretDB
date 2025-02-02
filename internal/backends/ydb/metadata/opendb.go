@@ -19,7 +19,6 @@ func openDB(dsn string, _ *slog.Logger, _ *state.Provider) (*ydb.Driver, error) 
 	if err != nil {
 		panic(fmt.Errorf("connect error: %w", err))
 	}
-	defer driver.Close(ctx)
 
 	return driver, nil
 }

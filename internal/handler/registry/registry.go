@@ -63,6 +63,9 @@ type NewHandlerOpts struct {
 	// for `mysql` handler
 	MySQLURL string
 
+	// for `ydb` handler
+	YdbURL string
+
 	TestOpts
 
 	_ struct{} // prevent unkeyed literals
@@ -106,7 +109,7 @@ func Handlers() []string {
 	res := make([]string, 0, len(registry))
 
 	// double check registered names and return them in the right order
-	for _, h := range []string{"postgresql", "sqlite", "hana", "mysql"} {
+	for _, h := range []string{"postgresql", "sqlite", "hana", "mysql", "ydb"} {
 		if _, ok := registry[h]; !ok {
 			continue
 		}

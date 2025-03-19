@@ -25,7 +25,9 @@ func New(dsn string, l *slog.Logger, sp *state.Provider) (*DB, error) {
 		return nil, lazyerrors.Error(err)
 	}
 
-	driver, err := openDB(baseURI.String(), l, sp)
+	values := baseURI.Query()
+	baseURI.RawQuery = values.Encode()
+	driver, err := openDB(baseURI, l, sp)
 	if err != nil {
 		return nil, err
 	}

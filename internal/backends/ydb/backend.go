@@ -1,13 +1,16 @@
 package ydb
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
+	"slices"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
+	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/state"
 )
 
@@ -20,16 +23,16 @@ type backend struct {
 //
 //nolint:vet // for readability
 type NewBackendParams struct {
-	URI string
-	L   *slog.Logger
-	P   *state.Provider
-	_   struct{} // prevent unkeyed literals
+	URI       string
+	L         *slog.Logger
+	P         *state.Provider
+	BatchSize int
+	_         struct{} // prevent unkeyed literals
 }
 
 // NewBackend creates a new Backend.
 func NewBackend(params *NewBackendParams) (backends.Backend, error) {
-	// TODO: implement me
-	r, err := metadata.NewRegistry(params.URI, params.L, params.P)
+	r, err := metadata.NewRegistry(params.URI, params.BatchSize, params.L, params.P)
 	if err != nil {
 		return nil, err
 	}
@@ -46,19 +49,94 @@ func (b *backend) Close() {
 
 // Status implements backends.Backend interface.
 func (b *backend) Status(ctx context.Context, params *backends.StatusParams) (*backends.StatusResult, error) {
-	panic("implement me")
+	dbs, err := b.r.DatabaseList(ctx)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	var res backends.StatusResult
+
+	var pingSucceeded bool
+
+	for _, dbName := range dbs {
+		var cs []*metadata.Collection
+
+		if cs, err = b.r.CollectionList(ctx, dbName); err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		res.CountCollections += int64(len(cs))
+
+		colls, err := newDatabase(b.r, dbName).ListCollections(ctx, new(backends.ListCollectionsParams))
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		for _, cInfo := range colls.Collections {
+			if cInfo.Capped() {
+				res.CountCappedCollections++
+			}
+		}
+
+		if pingSucceeded {
+			continue
+		}
+
+		p, err := b.r.DatabaseGetExisting(ctx, dbName)
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		if p == nil {
+			continue
+		}
+
+		pingSucceeded = true
+	}
+
+	return &res, nil
 }
 
 // Database implements backends.Backend interface.
 func (b *backend) Database(name string) (backends.Database, error) {
-	panic("implement me")
+	return newDatabase(b.r, name), nil
 }
 
 // ListDatabases implements backends.Backend interface.
 //
 //nolint:lll // for readability
 func (b *backend) ListDatabases(ctx context.Context, params *backends.ListDatabasesParams) (*backends.ListDatabasesResult, error) {
-	panic("implement me")
+	list, err := b.r.DatabaseList(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var res *backends.ListDatabasesResult
+
+	if params != nil && len(params.Name) > 0 {
+		i, found := slices.BinarySearchFunc(list, params.Name, func(dbName, t string) int {
+			return cmp.Compare(dbName, t)
+		})
+
+		var filteredList []string
+
+		if found {
+			filteredList = append(filteredList, list[i])
+		}
+
+		list = filteredList
+	}
+
+	res = &backends.ListDatabasesResult{
+		Databases: make([]backends.DatabaseInfo, 0, len(list)),
+	}
+
+	for _, dbName := range list {
+		res.Databases = append(res.Databases, backends.DatabaseInfo{
+			Name: dbName,
+		})
+	}
+	return res, nil
 }
 
 // DropDatabase implements backends.Backend interface.
@@ -68,12 +146,12 @@ func (b *backend) DropDatabase(ctx context.Context, params *backends.DropDatabas
 
 // Describe implements prometheus.Collector.
 func (b *backend) Describe(ch chan<- *prometheus.Desc) {
-	panic("implement me")
+	b.r.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
 func (b *backend) Collect(ch chan<- prometheus.Metric) {
-	panic("implement me")
+	b.r.Collect(ch)
 }
 
 // check interfaces

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/ydb-platform/ydb-go-sdk/v3"
@@ -11,11 +12,19 @@ import (
 	"github.com/FerretDB/FerretDB/internal/util/state"
 )
 
-func openDB(dsn string, _ *slog.Logger, _ *state.Provider) (*ydb.Driver, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+func openDB(dsn *url.URL, l *slog.Logger, _ *state.Provider) (*ydb.Driver, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	driver, err := ydb.Open(ctx, dsn)
+	l.Info(dsn.String())
+
+	// user := dsn.User
+	// username := user.Username()
+	// password, _ := user.Password()
+	dsn.User = nil
+
+	l.Info(dsn.String())
+	driver, err := ydb.Open(ctx, dsn.String())
 	if err != nil {
 		panic(fmt.Errorf("connect error: %w", err))
 	}
@@ -24,6 +33,11 @@ func openDB(dsn string, _ *slog.Logger, _ *state.Provider) (*ydb.Driver, error) 
 }
 
 // checkConnection checks that connection works and YDB settings are what we expect.
-func checkConnection(ctx context.Context, driver *ydb.Driver) error {
-	panic("implement me")
+func checkConnection(ctx context.Context, driver *ydb.Driver, l *slog.Logger) error {
+	_, err := driver.Discovery().WhoAmI(ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/FerretDB/FerretDB/internal/util/resource"
+	"github.com/ydb-platform/ydb-go-sdk/v3/sugar"
 	"hash/fnv"
 	"log/slog"
 	"path"
@@ -41,7 +43,7 @@ const (
 )
 
 type Registry struct {
-	d         *DB
+	D         *DB
 	l         *slog.Logger
 	BatchSize int
 	rw        sync.RWMutex
@@ -56,7 +58,7 @@ func NewRegistry(dsn string, batchSize int, l *slog.Logger, sp *state.Provider) 
 	}
 
 	r := &Registry{
-		d:         db,
+		D:         db,
 		l:         l,
 		BatchSize: batchSize,
 	}
@@ -68,11 +70,38 @@ func NewRegistry(dsn string, batchSize int, l *slog.Logger, sp *state.Provider) 
 func (r *Registry) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	r.d.driver.Close(ctx)
+	r.D.Driver.Close(ctx)
+
+	resource.Untrack(r.D, r.D.token)
 }
 
-// initCollections loads collections metadata from the database during initialization.
-func (r *Registry) initCollections(ctx context.Context, dbName string) error {
+// LoadMetadata loads collections metadata from the database during initialization
+// if it hasn't been loaded from the database yet.
+//
+// It acquires read lock to check metadata, if metadata is empty it acquires write lock
+// to load metadata, so it is safe for concurrent use.
+//
+// All methods should use this method to check authentication and load metadata.
+func (r *Registry) LoadMetadata(ctx context.Context, dbName string) error {
+	r.rw.RLock()
+	if r.colls != nil {
+		r.rw.RUnlock()
+		return nil
+	}
+	r.rw.RUnlock()
+
+	r.colls = make(map[string]map[string]*Collection)
+
+	absTablePath := path.Join(dbName, metadataTableName)
+	exists, err := sugar.IsTableExists(ctx, r.D.Driver.Scheme(), absTablePath)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		return nil
+	}
+
 	readTx := table.TxControl(
 		table.BeginTx(
 			table.WithOnlineReadOnly(),
@@ -80,7 +109,7 @@ func (r *Registry) initCollections(ctx context.Context, dbName string) error {
 		table.CommitTx(),
 	)
 
-	err := r.d.driver.Table().Do(ctx,
+	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			var (
 				res      result.Result
@@ -90,8 +119,8 @@ func (r *Registry) initCollections(ctx context.Context, dbName string) error {
 			query := fmt.Sprintf(
 				`PRAGMA TablePathPrefix("%v");
 
-				SELECT %s FROM %s`,
-				"/local",
+						SELECT %s FROM %s`,
+				dbName,
 				DefaultColumn,
 				metadataTableName,
 			)
@@ -176,6 +205,10 @@ func (r *Registry) DatabaseGetExisting(ctx context.Context, dbName string) (map[
 //
 // If the user is not authenticated, it returns error.
 func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error {
+	if err := r.LoadMetadata(ctx, dbName); err != nil {
+		return lazyerrors.Error(err)
+	}
+
 	r.rw.Lock()
 	defer r.rw.Unlock()
 
@@ -188,14 +221,17 @@ func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error
 //
 // It does not hold the lock.
 func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error {
-	name := r.d.driver.Name()
+	db := r.colls[dbName]
+	if db != nil {
+		return nil
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := r.d.driver.Table().Do(ctx,
+	err := r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
-			return s.CreateTable(ctx, path.Join(name, metadataTableName),
+			return s.CreateTable(ctx, path.Join(dbName, metadataTableName),
 				options.WithColumn("meta_id", types.TypeUUID),
 				options.WithColumn(DefaultColumn, types.Optional(types.TypeJSONDocument)),
 				options.WithPrimaryKeyColumn("meta_id"),
@@ -206,7 +242,6 @@ func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error
 		fmt.Printf("Failed to create table: %v\n", err)
 	}
 
-	r.colls = make(map[string]map[string]*Collection)
 	r.colls[dbName] = map[string]*Collection{}
 
 	return nil
@@ -227,12 +262,18 @@ func (ccp *CollectionCreateParams) Capped() bool {
 }
 
 // CollectionCreate creates a collection in the database.
-
+//
 // Returned boolean value indicates whether the collection was created.
 // If collection already exists, (false, nil) is returned.
 //
 // If the user is not authenticated, it returns error.
 func (r *Registry) CollectionCreate(ctx context.Context, params *CollectionCreateParams) (bool, error) {
+	if err := r.LoadMetadata(ctx, params.DBName); err != nil {
+		return false, lazyerrors.Error(err)
+	}
+
+	r.rw.Lock()
+	defer r.rw.Unlock()
 
 	return r.collectionCreate(ctx, params)
 }
@@ -249,6 +290,11 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 	err := r.databaseGetOrCreate(ctx, dbName)
 	if err != nil {
 		return false, lazyerrors.Error(err)
+	}
+
+	colls := r.colls[dbName]
+	if colls != nil && colls[collectionName] != nil {
+		return false, nil
 	}
 
 	id := uuid.New()
@@ -268,7 +314,6 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		return false, fmt.Errorf("failed to marshal collection data: %v", err)
 	}
 
-	name := r.d.driver.Name()
 	columns := []options.CreateTableOption{
 		options.WithColumn(DefaultColumn, types.Optional(types.TypeJSONDocument)),
 	}
@@ -279,12 +324,12 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		columns = append(columns, options.WithColumn(RecordIDColumn, types.TypeUUID))
 		primaryKey = RecordIDColumn
 	}
-	columns = append(columns, options.WithColumn("id", types.TypeUUID))
+	columns = append(columns, options.WithColumn("id", types.TypeString))
 	primaryKey = "id"
 
-	err = r.d.driver.Table().Do(ctx,
+	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
-			return s.CreateTable(ctx, path.Join(name, tableName),
+			return s.CreateTable(ctx, path.Join(dbName, tableName),
 				append(columns, options.WithPrimaryKeyColumn(primaryKey))...,
 			)
 		})
@@ -302,7 +347,7 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 
 		REPLACE INTO %s (meta_id, _jsonb)
 		VALUES ($meta_id, $json);
-		`, "/local", metadataTableName)
+		`, dbName, metadataTableName)
 
 	writeTx := table.TxControl(
 		table.BeginTx(
@@ -311,7 +356,7 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		table.CommitTx(),
 	)
 
-	err = r.d.driver.Table().Do(ctx,
+	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			_, _, err = s.Execute(ctx, writeTx, query, table.NewQueryParameters(
 				table.ValueParam("$meta_id", types.UuidValue(id)),
@@ -361,12 +406,13 @@ func (r *Registry) collectionGet(dbName, collectionName string) *Collection {
 	return colls[collectionName].deepCopy()
 }
 
+// CollectionList returns a sorted copy of collections in the database.
+//
+// If database does not exist, no error is returned.
+//
+// If the user is not authenticated, it returns error.
 func (r *Registry) CollectionList(ctx context.Context, dbName string) ([]*Collection, error) {
-	dbName = "local"
-
-	r.colls = make(map[string]map[string]*Collection)
-
-	if err := r.initCollections(ctx, dbName); err != nil {
+	if err := r.LoadMetadata(ctx, dbName); err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
@@ -385,21 +431,34 @@ func (r *Registry) CollectionList(ctx context.Context, dbName string) ([]*Collec
 
 	sort.Slice(res, func(i, j int) bool { return res[i].Name < res[j].Name })
 
-	fmt.Println(res)
 	return res, nil
 }
 
+// CollectionDrop drops a collection in the database.
+//
+// Returned boolean value indicates whether the collection was dropped.
+// If database or collection did not exist, (false, nil) is returned.
+//
+// If the user is not authenticated, it returns error.
 func (r *Registry) CollectionDrop(ctx context.Context, dbName, collectionName string) (bool, error) {
-	dbName = "local"
+	if err := r.LoadMetadata(ctx, dbName); err != nil {
+		return false, lazyerrors.Error(err)
+	}
+
 	r.rw.Lock()
 	defer r.rw.Unlock()
 
 	return r.collectionDrop(ctx, dbName, collectionName)
 }
 
+// collectionDrop drops a collection in the database.
+//
+// Returned boolean value indicates whether the collection was dropped.
+// If database or collection did not exist, (false, nil) is returned.
+//
+// It does not hold the lock.
 func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName string) (bool, error) {
 	db := r.colls[dbName]
-	fmt.Println(db)
 	if db == nil {
 		return false, nil
 	}
@@ -410,7 +469,7 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 	}
 
 	id := uuid.MustParse(c.UUID)
-	err := r.d.driver.Table().Do(ctx,
+	err := r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) error {
 			return s.DropTable(ctx, path.Join(dbName, c.TableName))
 		})
@@ -427,13 +486,13 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 
 		DELETE FROM %s WHERE meta_id=$meta_id`,
 
-		"/local",
+		dbName,
 		metadataTableName,
 	)
 
 	writeTx := table.TxControl(table.BeginTx(table.WithSerializableReadWrite()), table.CommitTx())
 
-	err = r.d.driver.Table().Do(ctx,
+	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) error {
 			_, _, err := s.Execute(
 				ctx,
@@ -457,6 +516,14 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 	return true, nil
 }
 
+// CollectionRename renames a collection in the database.
+//
+// The collection name is updated, but original table name is kept.
+//
+// Returned boolean value indicates whether the collection was renamed.
+// If database or collection did not exist, (false, nil) is returned.
+//
+// If the user is not authenticated, it returns error.
 func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionName, newCollectionName string) (bool, error) {
 	r.rw.Lock()
 	defer r.rw.Unlock()
@@ -478,37 +545,40 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 		return false, lazyerrors.Error(err)
 	}
 
-	arg, err := sjson.MarshalSingleValue(oldCollectionName)
-	if err != nil {
-		return false, lazyerrors.Error(err)
-	}
-
 	q := fmt.Sprintf(
-		`ALTER TABLE %s SET %s = $1 WHERE %s = $2`,
-		path.Join(dbName, metadataTableName),
-		DefaultColumn,
-		"json path to id",
-	) // do add and drop.................
+		`PRAGMA TablePathPrefix("%v");
+				DECLARE $meta_id AS Uuid;
+				DECLARE $json AS JsonDocument;
 
-	err = r.d.driver.Table().Do(ctx,
-		func(ctx context.Context, s table.Session) error {
-			_, _, err := s.Execute(
+				REPLACE INTO %s (meta_id, _jsonb) VALUES ($meta_id, $json);`,
+
+		"/local",
+		metadataTableName,
+	)
+	id := uuid.MustParse(c.UUID)
+
+	writeTx := table.TxControl(
+		table.BeginTx(
+			table.WithSerializableReadWrite(),
+		),
+		table.CommitTx(),
+	)
+
+	err = r.D.Driver.Table().Do(ctx,
+		func(ctx context.Context, s table.Session) (err error) {
+			_, _, err = s.Execute(
 				ctx,
-				table.DefaultTxControl(),
+				writeTx,
 				q,
 				table.NewQueryParameters(
-					table.ValueParam("$1", types.BytesValue(b)),
-					table.ValueParam("$2", types.BytesValue(arg)),
+					table.ValueParam("$meta_id", types.UuidValue(id)),
+					table.ValueParam("$json", types.BytesValue(b)),
 				))
-
-			if err != nil {
-				return err
-			}
 			return err
 		})
 
 	if err != nil {
-		return false, err
+		return false, lazyerrors.Error(err)
 	}
 
 	r.colls[dbName][newCollectionName] = c
@@ -680,36 +750,6 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 			db,
 		)
 	}
-}
-
-func (r *Registry) CollectionsStats(ctx context.Context, list []*Collection, refresh bool) (*stats, error) {
-	c := r.d.driver.Table()
-	err := c.Do(ctx,
-		func(ctx context.Context, s table.Session) error {
-			desc, err := s.DescribeTable(ctx, "path")
-			if err != nil {
-				return err
-			}
-
-			for i := range desc.Columns {
-				print("column, name: %s, %s", desc.Columns[i].Type, desc.Columns[i].Name)
-			}
-
-			return nil
-		},
-	)
-	if err != nil {
-		return &stats{}, err
-	}
-
-	return &stats{}, nil
-}
-
-type stats struct {
-	CountDocuments  int64
-	SizeIndexes     int64
-	SizeTables      int64
-	SizeFreeStorage int64
 }
 
 // check interfaces

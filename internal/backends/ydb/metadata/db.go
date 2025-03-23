@@ -15,7 +15,7 @@ type DB struct {
 	baseURI url.URL
 	l       *slog.Logger
 	sp      *state.Provider
-	driver  *ydb.Driver
+	Driver  *ydb.Driver
 	token   *resource.Token
 }
 
@@ -36,7 +36,7 @@ func New(dsn string, l *slog.Logger, sp *state.Provider) (*DB, error) {
 		baseURI: *baseURI,
 		l:       l,
 		sp:      sp,
-		driver:  driver,
+		Driver:  driver,
 		token:   resource.NewToken(),
 	}
 

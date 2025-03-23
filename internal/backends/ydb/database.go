@@ -76,7 +76,7 @@ func (db *database) ListCollections(ctx context.Context, params *backends.ListCo
 
 // CreateCollection implements backends.Database interface.
 func (db *database) CreateCollection(ctx context.Context, params *backends.CreateCollectionParams) error {
-	db.name = "/local"
+	db.name = "local"
 	created, err := db.r.CollectionCreate(ctx, &metadata.CollectionCreateParams{
 		DBName:          db.name,
 		Name:            params.Name,
@@ -166,19 +166,27 @@ func (db *database) Stats(ctx context.Context, params *backends.DatabaseStatsPar
 		return nil, lazyerrors.Error(err)
 	}
 
-	stats, err := db.r.CollectionsStats(ctx, list, params.Refresh)
-	if err != nil {
-		return nil, lazyerrors.Error(err)
+	var totalDocs, totalSizeTables, totalSizeIndexes, totalFreeStorage int64
+
+	for _, coll := range list {
+		stats, err := collectionsStats(ctx, db.r.D.Driver, db.name, coll, params.Refresh)
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		totalDocs += stats.countDocuments
+		totalSizeTables += stats.sizeTables
+		totalSizeIndexes += stats.sizeIndexes
+		totalFreeStorage += stats.sizeFreeStorage
 	}
 
 	return &backends.DatabaseStatsResult{
-		CountDocuments:  stats.CountDocuments,
-		SizeTotal:       1,
-		SizeIndexes:     stats.SizeIndexes,
-		SizeCollections: stats.SizeTables,
-		SizeFreeStorage: stats.SizeFreeStorage,
+		CountDocuments:  totalDocs,
+		SizeTotal:       totalSizeTables,
+		SizeIndexes:     totalSizeIndexes,
+		SizeCollections: totalSizeTables,
+		SizeFreeStorage: totalFreeStorage,
 	}, nil
-
 }
 
 // check interfaces

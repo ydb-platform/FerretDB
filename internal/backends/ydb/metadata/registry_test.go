@@ -29,7 +29,7 @@ func createDatabase(t *testing.T, ctx context.Context) (*Registry, string) {
 
 	err = r.D.Driver.Scheme().MakeDirectory(ctx, u)
 	if err != nil {
-		fmt.Printf("failed to make directory: %v", err)
+		t.Logf("failed to make directory: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -39,9 +39,6 @@ func createDatabase(t *testing.T, ctx context.Context) (*Registry, string) {
 		}
 
 		err = sugar.RemoveRecursive(ctx, r.D.Driver, u)
-		if err != nil {
-			fmt.Printf("failed to remove dirs recursively: %v", err)
-		}
 		require.NoError(t, err)
 
 		r.Close()
@@ -100,5 +97,137 @@ func TestCreateDropStress(t *testing.T) {
 		<-start
 
 		testCollection(t, ctx, r, dbName, collectionName)
+	})
+}
+
+func TestCreateSameStress(t *testing.T) {
+	ctx := conninfo.Ctx(testutil.Ctx(t), conninfo.New())
+	r, dbName := createDatabase(t, ctx)
+	collectionName := testutil.CollectionName(t)
+
+	var createdTotal atomic.Int32
+
+	teststress.Stress(t, func(ready chan<- struct{}, start <-chan struct{}) {
+
+		ready <- struct{}{}
+		<-start
+
+		created, err := r.CollectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: collectionName})
+		require.NoError(t, err)
+		if created {
+			createdTotal.Add(1)
+		}
+
+		created, err = r.CollectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: collectionName})
+		require.NoError(t, err)
+		require.False(t, created)
+
+		c, err := r.CollectionGet(ctx, dbName, collectionName)
+		require.NoError(t, err)
+		require.NotNil(t, c)
+		require.Equal(t, collectionName, c.Name)
+
+		list, err := r.CollectionList(ctx, dbName)
+		require.NoError(t, err)
+		require.Contains(t, list, c)
+	})
+
+	require.Equal(t, int32(1), createdTotal.Load())
+}
+
+func TestDropSameStress(t *testing.T) {
+	ctx := conninfo.Ctx(testutil.Ctx(t), conninfo.New())
+	r, dbName := createDatabase(t, ctx)
+	collectionName := testutil.CollectionName(t)
+
+	created, err := r.CollectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: collectionName})
+	require.NoError(t, err)
+	require.True(t, created)
+
+	var droppedTotal atomic.Int32
+
+	teststress.Stress(t, func(ready chan<- struct{}, start <-chan struct{}) {
+		ready <- struct{}{}
+		<-start
+
+		dropped, err := r.CollectionDrop(ctx, dbName, collectionName)
+		require.NoError(t, err)
+		if dropped {
+			droppedTotal.Add(1)
+		}
+	})
+
+	require.Equal(t, int32(1), droppedTotal.Load())
+}
+
+func TestCreateDropSameStress(t *testing.T) {
+	ctx := conninfo.Ctx(testutil.Ctx(t), conninfo.New())
+	r, dbName := createDatabase(t, ctx)
+	collectionName := testutil.CollectionName(t)
+
+	var i, createdTotal, droppedTotal atomic.Int32
+
+	teststress.Stress(t, func(ready chan<- struct{}, start <-chan struct{}) {
+		id := i.Add(1)
+
+		ready <- struct{}{}
+		<-start
+
+		if id%2 == 0 {
+			created, err := r.CollectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: collectionName})
+			require.NoError(t, err)
+			if created {
+				createdTotal.Add(1)
+			}
+		} else {
+			dropped, err := r.CollectionDrop(ctx, dbName, collectionName)
+			require.NoError(t, err)
+			if dropped {
+				droppedTotal.Add(1)
+			}
+		}
+	})
+
+	require.Less(t, int32(1), createdTotal.Load())
+	require.Less(t, int32(1), droppedTotal.Load())
+}
+
+func TestRenameCollection(t *testing.T) {
+	t.Parallel()
+
+	ctx := conninfo.Ctx(testutil.Ctx(t), conninfo.New())
+	r, dbName := createDatabase(t, ctx)
+
+	oldCollectionName := testutil.CollectionName(t)
+	newCollectionName := "new"
+
+	created, err := r.CollectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: oldCollectionName})
+	require.NoError(t, err)
+	require.True(t, created)
+
+	oldCollection, err := r.CollectionGet(ctx, dbName, oldCollectionName)
+	require.NoError(t, err)
+
+	t.Run("CollectionRename", func(t *testing.T) {
+		var renamed bool
+		renamed, err = r.CollectionRename(ctx, dbName, oldCollectionName, newCollectionName)
+		require.NoError(t, err)
+		require.True(t, renamed)
+	})
+
+	t.Run("CheckCollectionRenamed", func(t *testing.T) {
+		err = r.LoadMetadata(ctx, dbName)
+		require.NoError(t, err)
+
+		expected := &Collection{
+			Name:      newCollectionName,
+			UUID:      oldCollection.UUID,
+			TableName: oldCollection.TableName,
+			Indexes:   oldCollection.Indexes,
+		}
+
+		actual, err := r.CollectionGet(ctx, dbName, newCollectionName)
+		require.NoError(t, err)
+		require.Equal(t, expected, actual)
 	})
 }

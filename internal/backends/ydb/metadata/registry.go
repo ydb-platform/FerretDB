@@ -92,6 +92,7 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) error {
 
 	r.colls = make(map[string]map[string]*Collection)
 
+	dbName = "/local"
 	absTablePath := path.Join(dbName, metadataTableName)
 	exists, err := sugar.IsTableExists(ctx, r.D.Driver.Scheme(), absTablePath)
 	if err != nil {
@@ -144,7 +145,6 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) error {
 					err = res.ScanNamed(
 						named.OptionalWithDefault(DefaultColumn, &jsonData),
 					)
-					fmt.Println(jsonData)
 					if err != nil {
 						return lazyerrors.Error(err)
 					}
@@ -153,7 +153,6 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) error {
 					if err := json.Unmarshal([]byte(jsonData), &c); err != nil {
 						return lazyerrors.Error(err)
 					}
-					fmt.Println(c.Name)
 
 					colls[c.Name] = &c
 				}
@@ -287,6 +286,7 @@ func (r *Registry) CollectionCreate(ctx context.Context, params *CollectionCreat
 func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreateParams) (bool, error) {
 	dbName, collectionName := params.DBName, params.Name
 
+	dbName = "/local"
 	err := r.databaseGetOrCreate(ctx, dbName)
 	if err != nil {
 		return false, lazyerrors.Error(err)
@@ -338,7 +338,6 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		fmt.Printf("Failed to create table: %v\n", err)
 	}
 
-	// insert into metadata
 	query := fmt.Sprintf(`
 		PRAGMA TablePathPrefix("%v");
 
@@ -525,6 +524,10 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 //
 // If the user is not authenticated, it returns error.
 func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionName, newCollectionName string) (bool, error) {
+	if err := r.LoadMetadata(ctx, dbName); err != nil {
+		return false, lazyerrors.Error(err)
+	}
+
 	r.rw.Lock()
 	defer r.rw.Unlock()
 
@@ -540,7 +543,7 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 
 	c.Name = newCollectionName
 
-	b, err := sjson.Marshal(c.marshal())
+	b, err := json.Marshal(c)
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
@@ -552,7 +555,7 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 
 				REPLACE INTO %s (meta_id, _jsonb) VALUES ($meta_id, $json);`,
 
-		"/local",
+		dbName,
 		metadataTableName,
 	)
 	id := uuid.MustParse(c.UUID)
@@ -572,7 +575,7 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 				q,
 				table.NewQueryParameters(
 					table.ValueParam("$meta_id", types.UuidValue(id)),
-					table.ValueParam("$json", types.BytesValue(b)),
+					table.ValueParam("$json", types.JSONDocumentValueFromBytes(b)),
 				))
 			return err
 		})

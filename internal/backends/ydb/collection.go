@@ -5,14 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ydb-platform/ydb-go-sdk/v3"
-	"github.com/ydb-platform/ydb-go-sdk/v3/table"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"golang.org/x/exp/maps"
-	"sort"
-	"strings"
-	"sync"
-
 	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
 	"github.com/FerretDB/FerretDB/internal/handler/sjson"
@@ -21,18 +13,15 @@ import (
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/must"
 	"github.com/FerretDB/FerretDB/internal/util/resource"
+	"github.com/ydb-platform/ydb-go-sdk/v3"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
+	"golang.org/x/exp/maps"
+	"sort"
+	"sync"
+	"text/template"
 )
-
-type selectParams struct {
-	Schema  string
-	Table   string
-	Comment string
-
-	Capped        bool
-	OnlyRecordIDs bool
-}
 
 // collection implements backends.Collection interface.
 type collection struct {
@@ -169,17 +158,9 @@ func convertJSON(value any) any {
 	}
 }
 
-func prepareSelectClause(params *selectParams) string {
-	return fmt.Sprintf(
-		`
-				DECLARE $id AS Optional<Uint64>;
-				DECLARE $myStr AS Optional<Text>;
-				SELECT * FROM %s;`, params.Table)
-
-}
-
 // InsertAll implements backends.Collection interface.
 func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllParams) (*backends.InsertAllResult, error) {
+	c.dbName = "/local"
 	if _, err := c.r.CollectionCreate(ctx, &metadata.CollectionCreateParams{
 		DBName: c.dbName,
 		Name:   c.name,
@@ -204,40 +185,30 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 			var batch []*types.Document
 			docs := params.Docs
 
-			var values []string
-			var paramss []table.ParameterOption
+			var collectionData []ydbTypes.Value
+
 			for len(docs) > 0 {
 				i := min(batchSize, len(docs))
 				batch, docs = docs[:i], docs[i:]
 
-				for i, doc := range batch {
-
-					oid, _ := GetObjectID(doc)
-					oidStr := oid.Hex()
-
-					b, err := sjson.Marshal(doc)
-					if err != nil {
-						panic(err)
+				for _, doc := range batch {
+					var b []byte
+					if b, err = sjson.Marshal(doc); err != nil {
+						return lazyerrors.Error(err)
 					}
 
-					idParam := fmt.Sprintf("$id%d", i)
-					jsonbParam := fmt.Sprintf("$jsonb%d", i)
-
-					values = append(values, fmt.Sprintf("(%s, %s)", idParam, jsonbParam))
-					paramss = append(paramss,
-						table.ValueParam(fmt.Sprintf("$id%d", i), ydbTypes.BytesValue([]byte(oidStr))),
-						table.ValueParam(fmt.Sprintf("$jsonb%d", i), ydbTypes.JSONDocumentValueFromBytes(b)),
-					)
+					id := getId(doc)
+					collectionData = append(collectionData, data(id, b))
 				}
 			}
 
-			query := fmt.Sprintf(`
-            PRAGMA TablePathPrefix("/local");
-            UPSERT INTO %s (id, _jsonb) VALUES %s;
-        `, meta.TableName, strings.Join(values, ", "))
+			query := template.Must(template.New("upsert").Parse(upsertTemplate))
 
-			res, err := tx.Execute(ctx, query,
-				table.NewQueryParameters(paramss...),
+			res, err := tx.Execute(ctx, render(query, templateConfig{
+				TablePathPrefix: c.dbName,
+				Table:           meta.TableName,
+			}), table.NewQueryParameters(
+				table.ValueParam("$insertData", ydbTypes.ListValue(collectionData...))),
 			)
 			if err != nil {
 				return err
@@ -253,24 +224,6 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 	}
 
 	return new(backends.InsertAllResult), nil
-}
-
-func GetObjectID(d *types.Document) (primitive.ObjectID, error) {
-	if d == nil {
-		return primitive.NilObjectID, fmt.Errorf("document is nil")
-	}
-
-	value, err := d.Get("_id")
-	if err != nil {
-		return primitive.NilObjectID, fmt.Errorf("_id not found")
-	}
-
-	oid, ok := value.(primitive.ObjectID)
-	if !ok {
-		return primitive.NilObjectID, fmt.Errorf("invalid _id type: %T", value)
-	}
-
-	return oid, nil
 }
 
 // Query implements backends.Collection interface.
@@ -403,11 +356,125 @@ func (iter *queryIterator) close() {
 
 // DeleteAll implements backends.Collection interface.
 func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllParams) (*backends.DeleteAllResult, error) {
-	return &backends.DeleteAllResult{}, nil
+	c.dbName = "/local"
+	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if p == nil {
+		return &backends.DeleteAllResult{Deleted: 0}, nil
+	}
+
+	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if meta == nil {
+		return &backends.DeleteAllResult{Deleted: 0}, nil
+	}
+
+	var deleted int
+
+	var IDs []ydbTypes.Value
+	for _, id := range params.IDs {
+		IDs = append(IDs, ydbTypes.BytesValueFromString(id.(string)))
+	}
+
+	err = c.r.D.Driver.Table().DoTx(ctx,
+		func(ctx context.Context, tx table.TransactionActor) error {
+
+			query := template.Must(template.New("delete").Parse(deleteTemplate))
+
+			res, err := tx.Execute(ctx, render(query, templateConfig{
+				TablePathPrefix: c.dbName,
+				Table:           meta.TableName,
+			}), table.NewQueryParameters(
+				table.ValueParam("$IDs", ydbTypes.ListValue(IDs...)),
+			))
+			if err != nil {
+				return err
+			}
+			if err = res.Err(); err != nil {
+				return err
+			}
+
+			deleted = res.ResultSetCount()
+			_ = res.Close()
+
+			return nil
+		}, table.WithIdempotent())
+
+	if err != nil {
+		fmt.Printf("unexpected error: %v", err)
+		return nil, lazyerrors.Error(err)
+	}
+
+	return &backends.DeleteAllResult{Deleted: int32(deleted)}, nil
 }
 
 func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllParams) (*backends.UpdateAllResult, error) {
-	return nil, nil
+	c.dbName = "/local"
+	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	var updateAllResult backends.UpdateAllResult
+	if p == nil {
+		return &updateAllResult, nil
+	}
+
+	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if meta == nil {
+		return &updateAllResult, nil
+	}
+
+	err = c.r.D.Driver.Table().DoTx(
+		ctx,
+		func(ctx context.Context, tx table.TransactionActor) (err error) {
+			var collectionData []ydbTypes.Value
+
+			for _, doc := range params.Docs {
+				var b []byte
+				if b, err = sjson.Marshal(doc); err != nil {
+					return lazyerrors.Error(err)
+				}
+
+				id := getId(doc)
+				collectionData = append(collectionData, data(id, b))
+			}
+
+			query := template.Must(template.New("update").Parse(replaceTemplate))
+
+			res, err := tx.Execute(ctx, render(query, templateConfig{
+				TablePathPrefix: c.dbName,
+				Table:           meta.TableName,
+			}), table.NewQueryParameters(
+				table.ValueParam("$updateData", ydbTypes.ListValue(collectionData...))),
+			)
+			if err != nil {
+				return err
+			}
+			if err = res.Err(); err != nil {
+				return err
+			}
+
+			updateAllResult.Updated = int32(res.ResultSetCount())
+
+			return res.Close()
+		}, table.WithIdempotent(),
+	)
+	if err != nil {
+		fmt.Printf("unexpected error: %v", err)
+	}
+
+	return &updateAllResult, nil
 }
 
 // Stats implements backends.Collection interface.
@@ -494,7 +561,7 @@ func collectionsStats(ctx context.Context, driver *ydb.Driver, dbName string, co
 			})
 
 		if err != nil {
-			fmt.Printf("Failed to fill table with data: %v\n", err)
+			fmt.Printf("Failed to fill table with insertData: %v\n", err)
 		}
 	}
 

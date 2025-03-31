@@ -216,7 +216,7 @@ func TestRenameCollection(t *testing.T) {
 	})
 
 	t.Run("CheckCollectionRenamed", func(t *testing.T) {
-		err = r.LoadMetadata(ctx, dbName)
+		_, err = r.LoadMetadata(ctx, dbName)
 		require.NoError(t, err)
 
 		expected := &Collection{

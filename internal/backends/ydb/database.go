@@ -3,7 +3,10 @@ package ydb
 import (
 	"cmp"
 	"context"
+	"github.com/ydb-platform/ydb-go-sdk/v3/sugar"
+	"path"
 	"slices"
+	"time"
 
 	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
@@ -18,7 +21,41 @@ type database struct {
 
 // newDatabase creates a new Database.
 func newDatabase(r *metadata.Registry, name string) backends.Database {
-	print(name)
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
+
+	if _, ok := r.DbMapping[name]; ok {
+		return backends.DatabaseContract(&database{
+			r:    r,
+			name: name,
+		})
+	}
+
+	ydbPath := path.Join(r.D.Driver.Name(), name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	exists, err := sugar.IsDirectoryExists(ctx, r.D.Driver.Scheme(), ydbPath)
+	if err != nil {
+		return backends.DatabaseContract(&database{
+			r:    r,
+			name: name,
+		})
+	}
+
+	if !exists {
+		err = r.D.Driver.Scheme().MakeDirectory(ctx, ydbPath)
+		if err != nil {
+			return backends.DatabaseContract(&database{
+				r:    r,
+				name: name,
+			})
+		}
+	}
+
+	r.DbMapping[name] = ydbPath
+
 	return backends.DatabaseContract(&database{
 		r:    r,
 		name: name,
@@ -76,7 +113,6 @@ func (db *database) ListCollections(ctx context.Context, params *backends.ListCo
 
 // CreateCollection implements backends.Database interface.
 func (db *database) CreateCollection(ctx context.Context, params *backends.CreateCollectionParams) error {
-	db.name = "/local"
 	created, err := db.r.CollectionCreate(ctx, &metadata.CollectionCreateParams{
 		DBName:          db.name,
 		Name:            params.Name,

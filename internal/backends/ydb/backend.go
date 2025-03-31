@@ -42,6 +42,11 @@ func NewBackend(params *NewBackendParams) (backends.Backend, error) {
 	}), nil
 }
 
+// Database implements backends.Backend interface.
+func (b *backend) Database(name string) (backends.Database, error) {
+	return newDatabase(b.r, name), nil
+}
+
 // Close implements backends.Backend interface.
 func (b *backend) Close() {
 	b.r.Close()
@@ -95,11 +100,6 @@ func (b *backend) Status(ctx context.Context, params *backends.StatusParams) (*b
 	}
 
 	return &res, nil
-}
-
-// Database implements backends.Backend interface.
-func (b *backend) Database(name string) (backends.Database, error) {
-	return newDatabase(b.r, name), nil
 }
 
 // ListDatabases implements backends.Backend interface.

@@ -135,3 +135,16 @@ tasks:
         -target-url='mongodb://127.0.0.1:47017/'
         | tee new-mongodb.txt
       - ../bin/benchstat{{exeExt}} old-mongodb.txt new-mongodb.txt
+
+  bench-ydb:
+    desc: "Run benchmarks for `ydb` backend"
+    cmds:
+      - >
+        go test -tags={{.BUILD_TAGS}} -timeout=0 -run=XXX
+        -count={{.BENCH_COUNT}} -bench={{.BENCH_NAME}} -benchtime={{.BENCH_TIME}} -benchmem
+        -log-level=error
+        -bench-docs={{.BENCH_DOCS}}
+        -target-backend=ferretdb-ydb
+        -ydb-url=postgres://127.0.0.1:2136/local
+        | tee new-ydb.txt
+      - ../bin/benchstat{{exeExt}} old-ydb.txt new-ydb.txt

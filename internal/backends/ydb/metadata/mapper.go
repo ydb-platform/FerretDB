@@ -3,6 +3,7 @@ package metadata
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"github.com/FerretDB/FerretDB/internal/types"
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
@@ -81,11 +82,32 @@ func UnmarshalYDBValue(sch *elem) (ydbTypes.Type, error) {
 		res = ydbTypes.TypeTimestamp
 	case elemTypeLong:
 		res = ydbTypes.TypeInt64
+	case elemTypeObjectID:
+		return res, lazyerrors.Errorf("object IDs don't need to be processed")
 	default:
 		return ydbTypes.TypeUnknown, lazyerrors.Errorf("UnmarshalYDBValue: unhandled type %q", sch.Type)
 	}
 
 	return res, nil
+}
+
+func ConvertToYDBValueByStringRepresentation(t any, v any) ydbTypes.Value {
+	switch t {
+	case "Utf8":
+		return ydbTypes.UTF8Value(v.(string))
+	case "Int32":
+		return ydbTypes.Int32Value(v.(int32))
+	case "Int64":
+		return ydbTypes.Int64Value(v.(int64))
+	case "Double":
+		return ydbTypes.DoubleValue(v.(float64))
+	case "Bool":
+		return ydbTypes.BoolValue(v.(bool))
+	case "String":
+		return ydbTypes.BytesValueFromString(v.(string))
+	default:
+		panic(fmt.Sprintf("unsupported type: %v", t))
+	}
 }
 
 func checkConsumed(dec *json.Decoder, r *bytes.Reader) error {
@@ -121,16 +143,12 @@ type elem struct {
 type elemType string
 
 const (
-	elemTypeObject    elemType = "object"
-	elemTypeArray     elemType = "array"
 	elemTypeDouble    elemType = "double"
 	elemTypeString    elemType = "string"
 	elemTypeBinData   elemType = "binData"
 	elemTypeObjectID  elemType = "objectId"
 	elemTypeBool      elemType = "bool"
 	elemTypeDate      elemType = "date"
-	elemTypeNull      elemType = "null"
-	elemTypeRegex     elemType = "regex"
 	elemTypeInt       elemType = "int"
 	elemTypeTimestamp elemType = "timestamp"
 	elemTypeLong      elemType = "long"

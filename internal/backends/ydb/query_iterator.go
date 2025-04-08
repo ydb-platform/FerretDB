@@ -1,4 +1,4 @@
-package query
+package ydb
 
 import (
 	"context"
@@ -31,7 +31,7 @@ type queryIterator struct {
 //
 // Nil rows are possible and return already done iterator.
 // It still should be Closed.
-func NewQueryIterator(ctx context.Context, rs result.BaseResult, onlyRecordIDs bool) types.DocumentsIterator {
+func NewQueryIterator(ctx context.Context, rs result.Result, onlyRecordIDs bool) types.DocumentsIterator {
 	iter := &queryIterator{
 		ctx:           ctx,
 		rs:            rs,
@@ -49,6 +49,7 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 	defer iter.m.Unlock()
 
 	var unused struct{}
+	var err error
 
 	// ignore context error, if any, if iterator is already closed
 	if iter.rs == nil {
@@ -75,14 +76,11 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 	var recordID int64
 	var b []byte
 
-	if iter.rs.HasNextRow() {
-		if err := iter.rs.ScanWithDefaults(&recordID, &b); err != nil {
-			iter.close()
-			return unused, nil, lazyerrors.Error(err)
-		}
+	if err := iter.rs.ScanWithDefaults(&b); err != nil {
+		iter.close()
+		return unused, nil, lazyerrors.Error(err)
 	}
 
-	var err error
 	doc := must.NotFail(types.NewDocument())
 
 	if !iter.onlyRecordIDs {

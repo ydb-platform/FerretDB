@@ -32,6 +32,8 @@ func createDatabase(t *testing.T, ctx context.Context) (*Registry, string) {
 		t.Logf("failed to make directory: %v", err)
 	}
 
+	r.DbMapping[u] = u
+
 	t.Cleanup(func() {
 		if t.Failed() {
 			t.Logf("Keeping database %s for debugging.", u)

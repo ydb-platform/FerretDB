@@ -11,7 +11,9 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"golang.org/x/exp/maps"
@@ -49,7 +51,7 @@ type Registry struct {
 	l         *slog.Logger
 	BatchSize int
 	Rw        sync.RWMutex
-	colls     map[string]map[string]*Collection // database name -> collection name -> collection
+	Colls     map[string]map[string]*Collection // database name -> collection name -> collection
 	DbMapping map[string]string
 }
 
@@ -90,23 +92,23 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) (string, err
 	ydbPath := r.DbMapping[dbName]
 
 	r.Rw.RLock()
-	if r.colls != nil {
+	if r.Colls != nil {
 		r.Rw.RUnlock()
-		return "", nil
+		return ydbPath, nil
 	}
 	r.Rw.RUnlock()
-
-	r.colls = make(map[string]map[string]*Collection)
 
 	absTablePath := path.Join(ydbPath, metadataTableName)
 	exists, err := sugar.IsTableExists(ctx, r.D.Driver.Scheme(), absTablePath)
 	if err != nil {
-		return "", err
+		return "", nil
 	}
 
 	if !exists {
 		return "", nil
 	}
+
+	r.Colls = make(map[string]map[string]*Collection)
 
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
@@ -115,19 +117,21 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) (string, err
 				jsonData string
 			)
 
-			query := fmt.Sprintf(
-				`PRAGMA TablePathPrefix("%v");
-
-						SELECT %s FROM %s`,
-				dbName,
-				DefaultColumn,
-				metadataTableName,
-			)
+			selectTemplate := `
+				PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
+				SELECT {{ .ColumnName }} FROM {{ .TableName }}
+			`
+			q := template.Must(template.New("select").Parse(selectTemplate))
+			fmt.Println(q)
 
 			_, res, err = s.Execute(
 				ctx,
 				transaction.ReadTx,
-				query,
+				render(q, templateConfig{
+					TablePathPrefix: ydbPath,
+					TableName:       metadataTableName,
+					ColumnName:      DefaultColumn,
+				}),
 				table.NewQueryParameters(),
 			)
 
@@ -160,7 +164,7 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) (string, err
 				return lazyerrors.Error(err)
 			}
 
-			r.colls[dbName] = colls
+			r.Colls[dbName] = colls
 
 			return nil
 		})
@@ -171,11 +175,15 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) (string, err
 // DatabaseList returns a sorted list of existing databases.
 //
 // If the user is not authenticated, it returns error.
-func (r *Registry) DatabaseList(ctx context.Context) ([]string, error) {
+func (r *Registry) DatabaseList(ctx context.Context, dbName string) ([]string, error) {
+	if _, err := r.LoadMetadata(ctx, dbName); err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
 	r.Rw.RLock()
 	defer r.Rw.RUnlock()
 
-	res := maps.Keys(r.colls)
+	res := maps.Keys(r.Colls)
 	sort.Strings(res)
 
 	return res, nil
@@ -185,10 +193,14 @@ func (r *Registry) DatabaseList(ctx context.Context) ([]string, error) {
 //
 // If the user is not authenticated, it returns error.
 func (r *Registry) DatabaseGetExisting(ctx context.Context, dbName string) (map[string]*Collection, error) {
+	if _, err := r.LoadMetadata(ctx, dbName); err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
 	r.Rw.RLock()
 	defer r.Rw.RUnlock()
 
-	db := r.colls[dbName]
+	db := r.Colls[dbName]
 	if db == nil {
 		return nil, nil
 	}
@@ -218,7 +230,7 @@ func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error
 //
 // It does not hold the lock.
 func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error {
-	db := r.colls[dbName]
+	db := r.Colls[dbName]
 	if db != nil {
 		return nil
 	}
@@ -241,7 +253,11 @@ func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error
 		fmt.Printf("Failed to create table: %v\n", err)
 	}
 
-	r.colls[dbName] = map[string]*Collection{}
+	if r.Colls == nil {
+		r.Colls = make(map[string]map[string]*Collection)
+	}
+
+	r.Colls[dbName] = map[string]*Collection{}
 
 	return nil
 }
@@ -292,7 +308,7 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		return false, lazyerrors.Error(err)
 	}
 
-	colls := r.colls[params.DBName]
+	colls := r.Colls[params.DBName]
 	if colls != nil && colls[collectionName] != nil {
 		return false, nil
 	}
@@ -335,10 +351,10 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		})
 
 	if err != nil {
-		fmt.Printf("Failed to create table: %v\n", err)
+		return false, lazyerrors.Error(err)
 	}
 
-	query := fmt.Sprintf(`
+	q := fmt.Sprintf(`
 		PRAGMA TablePathPrefix("%v");
 
 		DECLARE $meta_id as Uuid;
@@ -350,7 +366,7 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
-			_, _, err = s.Execute(ctx, transaction.WriteTx, query, table.NewQueryParameters(
+			_, _, err = s.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
 				table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
 				table.ValueParam("$json", ydbTypes.JSONDocumentValueFromBytes(jsonData)),
 			))
@@ -359,13 +375,13 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		})
 
 	if err != nil {
-		fmt.Printf("Failed to fill table with data: %v\n", err)
+		return false, lazyerrors.Error(err)
 	}
 
-	if r.colls[params.DBName] == nil {
-		r.colls[params.DBName] = map[string]*Collection{}
+	if r.Colls[params.DBName] == nil {
+		r.Colls[params.DBName] = map[string]*Collection{}
 	}
-	r.colls[params.DBName][collectionName] = c
+	r.Colls[params.DBName][collectionName] = c
 
 	return true, nil
 }
@@ -394,7 +410,7 @@ func (r *Registry) CollectionGet(ctx context.Context, dbName, collectionName str
 //
 // It does not hold the lock.
 func (r *Registry) collectionGet(dbName, collectionName string) *Collection {
-	colls := r.colls[dbName]
+	colls := r.Colls[dbName]
 	if colls == nil {
 		return nil
 	}
@@ -415,13 +431,13 @@ func (r *Registry) CollectionList(ctx context.Context, dbName string) ([]*Collec
 	r.Rw.RLock()
 	defer r.Rw.RUnlock()
 
-	db := r.colls[dbName]
+	db := r.Colls[dbName]
 	if db == nil {
 		return nil, nil
 	}
 
-	res := make([]*Collection, 0, len(r.colls[dbName]))
-	for _, c := range r.colls[dbName] {
+	res := make([]*Collection, 0, len(r.Colls[dbName]))
+	for _, c := range r.Colls[dbName] {
 		res = append(res, c.deepCopy())
 	}
 
@@ -447,6 +463,14 @@ func (r *Registry) CollectionDrop(ctx context.Context, dbName, collectionName st
 	return r.collectionDrop(ctx, dbName, collectionName)
 }
 
+const deleteFromMetadataTemplate = `
+					PRAGMA TablePathPrefix("%v");
+
+					DECLARE $meta_id AS Uuid;
+			
+					DELETE FROM %s WHERE meta_id=$meta_id
+`
+
 // collectionDrop drops a collection in the database.
 //
 // Returned boolean value indicates whether the collection was dropped.
@@ -454,7 +478,7 @@ func (r *Registry) CollectionDrop(ctx context.Context, dbName, collectionName st
 //
 // It does not hold the lock.
 func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName string) (bool, error) {
-	db := r.colls[dbName]
+	db := r.Colls[dbName]
 	if db == nil {
 		return false, nil
 	}
@@ -477,12 +501,7 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 	}
 
 	q := fmt.Sprintf(
-		`PRAGMA TablePathPrefix("%v");
-
-		DECLARE $meta_id AS Uuid;
-
-		DELETE FROM %s WHERE meta_id=$meta_id`,
-
+		deleteFromMetadataTemplate,
 		ydbPath,
 		metadataTableName,
 	)
@@ -506,7 +525,7 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 		return false, err
 	}
 
-	delete(r.colls[dbName], collectionName)
+	delete(r.Colls[dbName], collectionName)
 
 	return true, nil
 }
@@ -528,7 +547,7 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 	r.Rw.Lock()
 	defer r.Rw.Unlock()
 
-	db := r.colls[dbName]
+	db := r.Colls[dbName]
 	if db == nil {
 		return false, nil
 	}
@@ -574,8 +593,8 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 		return false, lazyerrors.Error(err)
 	}
 
-	r.colls[dbName][newCollectionName] = c
-	delete(r.colls[dbName], oldCollectionName)
+	r.Colls[dbName][newCollectionName] = c
+	delete(r.Colls[dbName], oldCollectionName)
 
 	return true, nil
 }
@@ -596,6 +615,15 @@ func (r *Registry) IndexesCreate(ctx context.Context, dbName, collectionName str
 	return r.indexesCreate(ctx, dbName, collectionName, indexes)
 }
 
+const replaceIntoMetadataTemplate = `
+				PRAGMA TablePathPrefix("%v");
+
+				DECLARE $meta_id AS Uuid;
+				DECLARE $json AS JsonDocument;
+
+				REPLACE INTO %s (meta_id, _jsonb) VALUES ($meta_id, $json);
+`
+
 // indexesCreate creates indexes in the collection.
 //
 // Existing indexes with given names are ignored.
@@ -607,7 +635,7 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		return lazyerrors.Error(err)
 	}
 
-	db := r.colls[dbName]
+	db := r.Colls[dbName]
 	if db == nil {
 		panic("database does not exist")
 	}
@@ -625,47 +653,50 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		}
 	}
 
-	var field string
-	for _, index := range indexes {
-		pairs := index.Key
-		for _, pair := range pairs {
-			field = pair.Field
-		}
-	}
-
 	created := make([]string, 0, len(indexes))
-	index := indexes[0]
-
 	ydbPath := r.DbMapping[dbName]
 
-	collType, err := selectJsonField(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field)
-	if err != nil {
-		return lazyerrors.Error(err)
+	for _, index := range indexes {
+		if coll, ok := allIndexes[index.Name]; ok && coll == collectionName {
+			continue
+		}
+
+		for i := range index.Key {
+			field := index.Key[i].Field
+
+			jsonData, err := SelectJsonField(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+
+			columnType, err := detectJsonFieldType(jsonData, field)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+
+			index.Key[i].YdbType = columnType.String()
+
+			err = addFieldColumn(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field, columnType)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+
+			err = updateColumnWithExistingValues(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field, columnType)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+
+			err = addIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+
+		}
+
+		created = append(created, index.Name)
+		c.Indexes = append(c.Indexes, index)
+		allIndexes[index.Name] = collectionName
 	}
-
-	err = addFieldColumn(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field, collType)
-	if err != nil {
-		return lazyerrors.Error(err)
-	}
-
-	err = updateColumnWithJsonValues(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field, collType)
-	if err != nil {
-		return lazyerrors.Error(err)
-	}
-
-	topicPath, consumerName := r.cdcFeed(ctx, ydbPath, c.TableName)
-	go func() {
-		cdcRead(ctx, r.D.Driver, consumerName, topicPath)
-	}()
-
-	err = addIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field)
-	if err != nil {
-		return lazyerrors.Error(err)
-	}
-
-	created = append(created, index.Name)
-	c.Indexes = append(c.Indexes, index)
-	allIndexes[index.Name] = collectionName
 
 	b, err := json.Marshal(c)
 	if err != nil {
@@ -673,13 +704,7 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 	}
 
 	q := fmt.Sprintf(
-		`PRAGMA TablePathPrefix("%v");
-
-				DECLARE $meta_id AS Uuid;
-				DECLARE $json AS JsonDocument;
-
-				REPLACE INTO %s (meta_id, _jsonb) VALUES ($meta_id, $json);`,
-
+		replaceIntoMetadataTemplate,
 		ydbPath,
 		metadataTableName,
 	)
@@ -702,7 +727,7 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		return lazyerrors.Error(err)
 	}
 
-	r.colls[dbName][collectionName] = c
+	r.Colls[dbName][collectionName] = c
 
 	return nil
 }
@@ -715,10 +740,15 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 //
 // If the user is not authenticated, it returns error.
 func (r *Registry) IndexesDrop(ctx context.Context, dbName, collectionName string, indexNames []string) error {
+	ydbPath, err := r.LoadMetadata(ctx, dbName)
+	if err != nil {
+		return lazyerrors.Error(err)
+	}
+
 	r.Rw.Lock()
 	defer r.Rw.Unlock()
 
-	return r.indexesDrop(ctx, dbName, collectionName, indexNames)
+	return r.indexesDrop(ctx, dbName, collectionName, indexNames, ydbPath)
 }
 
 // indexesDrop removes given connection's indexes.
@@ -728,7 +758,12 @@ func (r *Registry) IndexesDrop(ctx context.Context, dbName, collectionName strin
 // If database or collection does not exist, nil is returned.
 //
 // It does not hold the lock.
-func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName string, indexNames []string) error {
+func (r *Registry) indexesDrop(
+	ctx context.Context,
+	dbName,
+	collectionName string,
+	indexNames []string,
+	ydbPath string) error {
 	c := r.collectionGet(dbName, collectionName)
 	if c == nil {
 		return nil
@@ -740,10 +775,51 @@ func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName strin
 			continue
 		}
 
+		idx := strings.Index(name, "_")
+		name = name[:idx]
+		err := dropIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, name)
+		if err != nil {
+			return lazyerrors.Error(err)
+		}
+
+		err = dropFieldColumn(ctx, r.D.Driver.Table(), ydbPath, c.TableName, name)
+		if err != nil {
+			return lazyerrors.Error(err)
+		}
+
 		c.Indexes = slices.Delete(c.Indexes, i, i+1)
 	}
 
-	r.colls[dbName][collectionName] = c
+	id := uuid.MustParse(c.UUID)
+	b, err := json.Marshal(c)
+	if err != nil {
+		return lazyerrors.Error(err)
+	}
+
+	q := fmt.Sprintf(
+		replaceIntoMetadataTemplate,
+		ydbPath,
+		metadataTableName,
+	)
+
+	err = r.D.Driver.Table().Do(ctx,
+		func(ctx context.Context, s table.Session) (err error) {
+			_, _, err = s.Execute(
+				ctx,
+				transaction.WriteTx,
+				q,
+				table.NewQueryParameters(
+					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
+					table.ValueParam("$json", ydbTypes.JSONDocumentValueFromBytes(b)),
+				))
+			return err
+		})
+
+	if err != nil {
+		return lazyerrors.Error(err)
+	}
+
+	r.Colls[dbName][collectionName] = c
 
 	return nil
 }
@@ -766,10 +842,10 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 			nil, nil,
 		),
 		prometheus.GaugeValue,
-		float64(len(r.colls)),
+		float64(len(r.Colls)),
 	)
 
-	for db, colls := range r.colls {
+	for db, colls := range r.Colls {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(namespace, subsystem, "collections"),

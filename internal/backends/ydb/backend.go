@@ -54,7 +54,7 @@ func (b *backend) Close() {
 
 // Status implements backends.Backend interface.
 func (b *backend) Status(ctx context.Context, params *backends.StatusParams) (*backends.StatusResult, error) {
-	dbs, err := b.r.DatabaseList(ctx)
+	dbs, err := b.r.DatabaseList(ctx, "")
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
@@ -106,7 +106,11 @@ func (b *backend) Status(ctx context.Context, params *backends.StatusParams) (*b
 //
 //nolint:lll // for readability
 func (b *backend) ListDatabases(ctx context.Context, params *backends.ListDatabasesParams) (*backends.ListDatabasesResult, error) {
-	list, err := b.r.DatabaseList(ctx)
+	var dbName string
+	if params != nil {
+		dbName = params.Name
+	}
+	list, err := b.r.DatabaseList(ctx, dbName)
 	if err != nil {
 		return nil, err
 	}

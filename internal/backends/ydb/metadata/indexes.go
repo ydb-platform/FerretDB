@@ -5,16 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata/transaction"
-	"github.com/FerretDB/FerretDB/internal/backends/ydb/query"
-	"github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
-	"github.com/ydb-platform/ydb-go-sdk/v3/topic/topicoptions"
-	"github.com/ydb-platform/ydb-go-sdk/v3/topic/topicsugar"
-	"github.com/ydb-platform/ydb-go-sdk/v3/topic/topictypes"
-	"log"
 	"log/slog"
 	"path"
 	"slices"
@@ -31,23 +25,23 @@ type Indexes []IndexInfo
 
 // IndexInfo represents information about a single index.
 type IndexInfo struct {
-	Name    string
-	YDBType YDBIndexType
-	Key     []IndexKeyPair
-	Unique  bool
+	Name   string
+	Key    []IndexKeyPair
+	Unique bool
 }
 
 // IndexKeyPair consists of a field name and a sort order that are part of the index.
 type IndexKeyPair struct {
 	Field      string
+	YdbType    any
 	Descending bool
 }
 
-type YDBIndexType string
-
-const (
-	GlobalIndex YDBIndexType = "GLOBAL"
-)
+type IndexColumn struct {
+	ColumnName  string
+	ColumnType  any
+	ColumnValue any
+}
 
 // deepCopy returns a deep copy.
 func (indexes Indexes) deepCopy() Indexes {
@@ -55,10 +49,9 @@ func (indexes Indexes) deepCopy() Indexes {
 
 	for i, index := range indexes {
 		res[i] = IndexInfo{
-			Name:    index.Name,
-			YDBType: index.YDBType,
-			Key:     slices.Clone(index.Key),
-			Unique:  index.Unique,
+			Name:   index.Name,
+			Key:    slices.Clone(index.Key),
+			Unique: index.Unique,
 		}
 	}
 
@@ -81,7 +74,6 @@ func (indexes Indexes) marshal() *types.Array {
 		}
 
 		res.Append(must.NotFail(types.NewDocument(
-			"ydbindex", string(index.YDBType),
 			"name", index.Name,
 			"key", key,
 			"unique", index.Unique,
@@ -121,16 +113,13 @@ func (s *Indexes) unmarshal(a *types.Array) error {
 			}
 		}
 
-		ydbType, _ := index.Get("ydbindex")
-
 		v, _ = index.Get("unique")
 		unique, _ := v.(bool)
 
 		res[i] = IndexInfo{
-			Name:    must.NotFail(index.Get("name")).(string),
-			YDBType: YDBIndexType(ydbType.(string)),
-			Key:     key,
-			Unique:  unique,
+			Name:   must.NotFail(index.Get("name")).(string),
+			Key:    key,
+			Unique: unique,
 		}
 	}
 
@@ -139,86 +128,7 @@ func (s *Indexes) unmarshal(a *types.Array) error {
 	return nil
 }
 
-func (r *Registry) cdcFeed(ctx context.Context, prefix, tableName string) (string, string) {
-	topicPath := path.Join(prefix, tableName, "feed")
-	consumerName := "test-consumer"
-
-	err := addCdcToTable(
-		ctx,
-		r.D.Driver.Table(),
-		prefix, tableName,
-	)
-	if err != nil {
-		panic(fmt.Errorf("create table error: %w", err))
-	}
-	log.Println("Adding cdc feed table done")
-
-	log.Println("Create consumer")
-	err = r.D.Driver.Topic().Alter(ctx, topicPath, topicoptions.AlterWithAddConsumers(topictypes.Consumer{
-		Name: consumerName,
-	}))
-
-	if err != nil {
-		panic(fmt.Errorf("failed to create feed consumer: %w", err))
-	}
-
-	return topicPath, consumerName
-}
-
-func addCdcToTable(ctx context.Context, c table.Client, prefix, tableName string) (err error) {
-	err = c.Do(ctx, func(ctx context.Context, s table.Session) error {
-		q := fmt.Sprintf(`
-					PRAGMA TablePathPrefix("%v");
-					
-					ALTER TABLE
-						%v
-					ADD CHANGEFEED
-						feed
-					WITH (
-						FORMAT = 'JSON',
-						MODE = 'NEW_AND_OLD_IMAGES'
-					)
-					`,
-			prefix, tableName)
-
-		return s.ExecuteSchemeQuery(ctx, q)
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add changefeed to test table: %w", err)
-	}
-
-	return nil
-}
-
-func cdcRead(ctx context.Context, db *ydb.Driver, consumerName, topicPath string) {
-	log.Println("Start cdc read")
-	reader, err := db.Topic().StartReader(consumerName, []topicoptions.ReadSelector{{Path: topicPath}})
-	if err != nil {
-		log.Fatal("failed to start read feed", err)
-	}
-
-	for {
-		msg, err := reader.ReadMessage(ctx)
-		if err != nil {
-			panic(fmt.Errorf("failed to read message: %w", err))
-		}
-
-		var event interface{}
-		err = topicsugar.JSONUnmarshal(msg, &event)
-		if err != nil {
-			panic(fmt.Errorf("failed to unmarshal json cdc: %w", err))
-		}
-		log.Println("new cdc event:", event)
-		err = reader.Commit(ctx, msg)
-		if err != nil {
-			panic(fmt.Errorf("failed to commit message: %w", err))
-		}
-	}
-}
-
-func selectJsonField(ctx context.Context, c table.Client, prefix, tableName, column string) (ydbTypes.Type, error) {
-	q := query.Render(
-		template.Must(template.New("").Parse(`
+const fetchJsonTemplate = `
 			PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
 			
 			SELECT
@@ -228,41 +138,30 @@ func selectJsonField(ctx context.Context, c table.Client, prefix, tableName, col
 			WHERE
 				JSON_EXISTS(_jsonb, "$.{{ .ColumnName }}")
 			LIMIT 1;
-		`)),
-		query.TemplateConfig{
-			TablePathPrefix: prefix,
-			TableName:       tableName,
-			ColumnName:      column,
-		},
-	)
+`
 
-	var ydbType ydbTypes.Type
+func SelectJsonField(ctx context.Context, c table.Client, prefix, tableName, column string) (string, error) {
+	q := buildSelectJsonQuery(prefix, tableName, column)
+
+	var jsonData string
+
 	err := c.Do(ctx,
 		func(ctx context.Context, s table.Session) error {
-			_, res, err := s.Execute(ctx, transaction.ReadTx, q,
-				table.NewQueryParameters(),
-			)
+			_, res, err := s.Execute(ctx, transaction.ReadTx, q, table.NewQueryParameters())
 			if err != nil {
 				return err
 			}
 
-			defer func() {
-				_ = res.Close()
-			}()
+			defer res.Close()
 
-			var (
-				jsonData string
-			)
-			for res.NextResultSet(ctx) {
-				for res.NextRow() {
-					err = res.ScanNamed(
-						named.OptionalWithDefault(DefaultColumn, &jsonData),
-					)
-					if err != nil {
-						return err
-					}
+			if err = res.NextResultSetErr(ctx); err != nil {
+				return err
+			}
 
-					ydbType, err = MapToYdbType([]byte(jsonData), column)
+			for res.NextRow() {
+				err = res.ScanNamed(named.OptionalWithDefault(DefaultColumn, &jsonData))
+				if err != nil {
+					return err
 				}
 			}
 
@@ -270,7 +169,32 @@ func selectJsonField(ctx context.Context, c table.Client, prefix, tableName, col
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve: %w", err)
+		return jsonData, lazyerrors.Error(err)
+	}
+
+	return jsonData, nil
+}
+
+func buildSelectJsonQuery(prefix string, tableName string, column string) string {
+	q := render(template.Must(template.New("").Parse(fetchJsonTemplate)),
+		templateConfig{
+			TablePathPrefix: prefix,
+			TableName:       tableName,
+			ColumnName:      column,
+		},
+	)
+
+	return q
+}
+
+func detectJsonFieldType(jsonStr string, field string) (ydbTypes.Type, error) {
+	if jsonStr == "" {
+		return nil, errors.New("empty JSON string")
+	}
+
+	ydbType, err := MapToYdbType([]byte(jsonStr), field)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
 	}
 
 	return ydbType, nil
@@ -292,8 +216,24 @@ func addFieldColumn(ctx context.Context, c table.Client, prefix string, tableNam
 	return nil
 }
 
-func updateColumnWithJsonValues(ctx context.Context, c table.Client, prefix, tableName, column string, collType ydbTypes.Type) error {
-	q := query.Render(
+func dropFieldColumn(ctx context.Context, c table.Client, prefix string, tableName string, column string) error {
+	err := c.Do(ctx,
+		func(ctx context.Context, s table.Session) (err error) {
+			return s.AlterTable(ctx, path.Join(prefix, tableName),
+				options.WithDropColumn(column),
+			)
+		},
+		table.WithIdempotent(),
+	)
+	if err != nil {
+		return fmt.Errorf("unexpected error: %v", err)
+	}
+
+	return nil
+}
+
+func updateColumnWithExistingValues(ctx context.Context, c table.Client, prefix, tableName, column string, collType ydbTypes.Type) error {
+	q := render(
 		template.Must(template.New("").Parse(`
 			PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
 
@@ -304,7 +244,7 @@ func updateColumnWithJsonValues(ctx context.Context, c table.Client, prefix, tab
 			FROM {{ .TableName }}
 			WHERE JSON_EXISTS(_jsonb, "$.{{ .ColumnName }}");
 		`)),
-		query.TemplateConfig{
+		templateConfig{
 			TablePathPrefix: prefix,
 			TableName:       tableName,
 			ColumnName:      column,
@@ -343,7 +283,22 @@ func addIndex(ctx context.Context, c table.Client, prefix string, tableName stri
 		table.WithIdempotent(),
 	)
 	if err != nil {
-		return fmt.Errorf("unexpected error: %v", err)
+		return lazyerrors.Error(err)
+	}
+
+	return nil
+}
+
+func dropIndex(ctx context.Context, c table.Client, prefix string, tableName string, column string) error {
+	err := c.Do(ctx,
+		func(ctx context.Context, s table.Session) (err error) {
+			return s.AlterTable(ctx, path.Join(prefix, tableName),
+				options.WithDropIndex(fmt.Sprintf("idx_%s", column)))
+		},
+		table.WithIdempotent(),
+	)
+	if err != nil {
+		return lazyerrors.Error(err)
 	}
 
 	return nil

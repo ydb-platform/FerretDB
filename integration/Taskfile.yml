@@ -145,6 +145,6 @@ tasks:
         -log-level=error
         -bench-docs={{.BENCH_DOCS}}
         -target-backend=ferretdb-ydb
-        -ydb-url=postgres://127.0.0.1:2136/local
+        -ydb-url=grpc://127.0.0.1:2136/local
         | tee new-ydb.txt
       - ../bin/benchstat{{exeExt}} old-ydb.txt new-ydb.txt

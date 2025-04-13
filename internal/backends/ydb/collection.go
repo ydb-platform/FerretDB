@@ -13,6 +13,7 @@ import (
 	"github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
 	"sort"
 	"strings"
@@ -158,22 +159,22 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 		Capped: meta.Capped(),
 	}
 
-	var (
-		plan string
-		ast  string
-	)
+	var plan string
+
+	ydbPath := c.r.DbMapping[c.dbName]
 
 	q := PrepareSelectClause(opts)
+	q = fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n%s", ydbPath, q)
 
-	err = c.r.D.Driver.Table().Do( // Do retry operation on errors with best effort
-		ctx, // context manage exiting from Do
-		func(ctx context.Context, s table.Session) (err error) { // retry operation
+	err = c.r.D.Driver.Table().Do(
+		ctx,
+		func(ctx context.Context, s table.Session) (err error) {
 			explanation, err := s.Explain(ctx, q)
 			if err != nil {
-				return err // for auto-retry with driver
+				return err
 			}
 
-			plan, ast = explanation.Plan, explanation.AST
+			plan, _ = explanation.Plan, explanation.AST
 
 			return nil
 		},
@@ -183,10 +184,7 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 		panic(err)
 	}
 
-	fmt.Printf("Plan: %s\n", plan)
-	fmt.Printf("AST: %s\n", ast)
-
-	queryPlan, err := UnmarshalExplainFromString(plan)
+	queryPlan, err := UnmarshalExplain(plan)
 	res.QueryPlanner = queryPlan
 
 	return res, nil
@@ -253,7 +251,7 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 		}, table.WithIdempotent(),
 	)
 	if err != nil {
-		fmt.Printf("unexpected error: %v", err)
+		return nil, lazyerrors.Error(err)
 	}
 
 	return new(backends.InsertAllResult), nil
@@ -279,20 +277,24 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 		return &backends.DeleteAllResult{Deleted: 0}, nil
 	}
 
-	var deleted int
-
 	var IDs []ydbTypes.Value
 	for _, id := range params.IDs {
 		IDs = append(IDs, ydbTypes.BytesValueFromString(getIdFromAny(id)))
 	}
 
 	ydbPath := c.r.DbMapping[c.dbName]
+
+	var (
+		res          result.Result
+		deletedCount uint64
+	)
+
 	err = c.r.D.Driver.Table().DoTx(ctx,
-		func(ctx context.Context, tx table.TransactionActor) error {
+		func(ctx context.Context, tx table.TransactionActor) (err error) {
 
-			q := template.Must(template.New("delete").Parse(DeleteTemplate))
+			q := template.Must(template.New("delete").Parse(metadata.DeleteTemplate))
 
-			res, err := tx.Execute(ctx, Render(q, TemplateConfig{
+			res, err = tx.Execute(ctx, Render(q, TemplateConfig{
 				TablePathPrefix: ydbPath,
 				TableName:       meta.TableName,
 			}), table.NewQueryParameters(
@@ -305,18 +307,30 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 				return err
 			}
 
-			deleted = res.ResultSetCount()
+			err = res.NextResultSetErr(ctx)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+
+			for res.NextRow() {
+				err = res.ScanNamed(
+					named.OptionalWithDefault("deleted_count", &deletedCount),
+				)
+				if err != nil {
+					return lazyerrors.Error(err)
+				}
+			}
+
 			_ = res.Close()
 
 			return nil
 		}, table.WithIdempotent())
 
 	if err != nil {
-		fmt.Printf("unexpected error: %v", err)
 		return nil, lazyerrors.Error(err)
 	}
 
-	return &backends.DeleteAllResult{Deleted: int32(deleted)}, nil
+	return &backends.DeleteAllResult{Deleted: int32(deletedCount)}, nil
 }
 
 func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllParams) (*backends.UpdateAllResult, error) {

@@ -90,35 +90,13 @@ const (
 					FROM AS_TABLE($updateData);
 
 			`
-	DeleteTemplate = `
-					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
-					DECLARE $IDs AS List<String>;
-
-					DELETE FROM {{ .TableName }}
-					WHERE id IN $IDs;
-			`
 )
 
 func GetId(doc *types.Document) string {
-	var ydbId string
 	value, _ := doc.Get("_id")
 	must.NotBeZero(value)
 
-	switch v := value.(type) {
-	case types.ObjectID:
-		ydbId = hex.EncodeToString(v[:])
-	case string:
-		ydbId = v
-	case int:
-		ydbId = strconv.Itoa(v)
-	case int32:
-		ydbId = strconv.Itoa(int(v))
-	case int64:
-		ydbId = strconv.FormatInt(v, 10)
-	default:
-		panic(fmt.Sprintf("unsupported _id type: %T", value))
-	}
-	return ydbId
+	return getIdFromAny(value)
 }
 
 func getIdFromAny(value any) string {
@@ -182,23 +160,15 @@ func PrepareSelectClause(params *SelectParams) string {
 
 }
 
-func UnmarshalExplainFromString(explainStr string) (*types.Document, error) {
-	explainBytes := []byte(explainStr)
+func UnmarshalExplain(explainStr string) (*types.Document, error) {
+	b := []byte(explainStr)
 
-	return unmarshalExplain(explainBytes)
-}
-
-func unmarshalExplain(b []byte) (*types.Document, error) {
-	var plans []map[string]any
-	if err := json.Unmarshal(b, &plans); err != nil {
+	var plan map[string]any
+	if err := json.Unmarshal(b, &plan); err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	if len(plans) == 0 {
-		return nil, lazyerrors.Error(errors.New("no execution plan returned"))
-	}
-
-	return convertJSON(plans[0]).(*types.Document), nil
+	return convertJSON(plan).(*types.Document), nil
 }
 
 // convertJSON transforms decoded JSON map[string]any value into *types.Document.
@@ -260,6 +230,7 @@ func prepareWhereClause(sqlFilters *types.Document) (string, *table.QueryParamet
 		paramName := fmt.Sprintf("%s_%s", "f", rootKey)
 
 		var yqlExpr string
+
 		var param table.ParameterOption
 
 		switch val := rootVal.(type) {
@@ -287,7 +258,6 @@ func prepareWhereClause(sqlFilters *types.Document) (string, *table.QueryParamet
 			iter := val.Iterator()
 			defer iter.Close()
 
-			// iterate through subdocument, as it may contain operators
 			for {
 				k, v, err := iter.Next()
 				if err != nil {

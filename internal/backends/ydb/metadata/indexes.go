@@ -128,18 +128,6 @@ func (s *Indexes) unmarshal(a *types.Array) error {
 	return nil
 }
 
-const fetchJsonTemplate = `
-			PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
-			
-			SELECT
-				_jsonb
-			FROM
-				{{ .TableName }}
-			WHERE
-				JSON_EXISTS(_jsonb, "$.{{ .ColumnName }}")
-			LIMIT 1;
-`
-
 func SelectJsonField(ctx context.Context, c table.Client, prefix, tableName, column string) (string, error) {
 	q := buildSelectJsonQuery(prefix, tableName, column)
 
@@ -176,8 +164,8 @@ func SelectJsonField(ctx context.Context, c table.Client, prefix, tableName, col
 }
 
 func buildSelectJsonQuery(prefix string, tableName string, column string) string {
-	q := render(template.Must(template.New("").Parse(fetchJsonTemplate)),
-		templateConfig{
+	q := render(template.Must(template.New("").Parse(FetchJsonTemplate)),
+		TemplateConfig{
 			TablePathPrefix: prefix,
 			TableName:       tableName,
 			ColumnName:      column,
@@ -244,7 +232,7 @@ func updateColumnWithExistingValues(ctx context.Context, c table.Client, prefix,
 			FROM {{ .TableName }}
 			WHERE JSON_EXISTS(_jsonb, "$.{{ .ColumnName }}");
 		`)),
-		templateConfig{
+		TemplateConfig{
 			TablePathPrefix: prefix,
 			TableName:       tableName,
 			ColumnName:      column,

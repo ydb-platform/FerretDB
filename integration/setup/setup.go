@@ -67,7 +67,7 @@ var (
 
 // Other globals.
 var (
-	allBackends = []string{"ferretdb-postgresql", "ferretdb-sqlite", "ferretdb-mysql", "ferretdb-hana", "mongodb"}
+	allBackends = []string{"ferretdb-postgresql", "ferretdb-sqlite", "ferretdb-mysql", "ferretdb-hana", "ferretdb-ydb", "mongodb"}
 )
 
 // SetupOpts represents setup options.

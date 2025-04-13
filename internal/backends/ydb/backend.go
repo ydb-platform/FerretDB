@@ -145,7 +145,16 @@ func (b *backend) ListDatabases(ctx context.Context, params *backends.ListDataba
 
 // DropDatabase implements backends.Backend interface.
 func (b *backend) DropDatabase(ctx context.Context, params *backends.DropDatabaseParams) error {
-	panic("implement me")
+	dropped, err := b.r.DatabaseDrop(ctx, params.Name)
+	if err != nil {
+		return lazyerrors.Error(err)
+	}
+
+	if !dropped {
+		return backends.NewError(backends.ErrorCodeDatabaseDoesNotExist, nil)
+	}
+
+	return nil
 }
 
 // Describe implements prometheus.Collector.

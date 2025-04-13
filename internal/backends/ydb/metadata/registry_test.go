@@ -21,18 +21,11 @@ func createDatabase(t *testing.T, ctx context.Context) (*Registry, string) {
 	sp, err := state.NewProvider("")
 	require.NoError(t, err)
 
-	base := testutil.TestBaseYDBURI(t, ctx, "")
+	base := testutil.TestBaseYdbURI(t, "")
 	r, err := NewRegistry(base, 100, testutil.Logger(t), sp)
 	require.NoError(t, err)
 
-	u := testutil.TestYDBURI(t, ctx, base)
-
-	err = r.D.Driver.Scheme().MakeDirectory(ctx, u)
-	if err != nil {
-		t.Logf("failed to make directory: %v", err)
-	}
-
-	r.DbMapping[u] = u
+	u := testutil.TestYdbDirectory(t, base)
 
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -45,6 +38,7 @@ func createDatabase(t *testing.T, ctx context.Context) (*Registry, string) {
 
 		r.Close()
 	})
+
 	return r, u
 }
 

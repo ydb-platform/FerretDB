@@ -1,18 +1,15 @@
 package testutil
 
 import (
-	"context"
-	"net/url"
-	"path/filepath"
-	"testing"
-
 	"github.com/FerretDB/FerretDB/internal/util/testutil/testtb"
 	"github.com/stretchr/testify/require"
+	"net/url"
+	"testing"
 )
 
-// TestBaseYDBURI returns base YDB URI.
+// TestBaseYdbURI returns base YDB URI.
 // Base URI may be empty.
-func TestBaseYDBURI(tb testtb.TB, ctx context.Context, baseURI string) string {
+func TestBaseYdbURI(tb testtb.TB, baseURI string) string {
 	tb.Helper()
 
 	if testing.Short() {
@@ -26,9 +23,9 @@ func TestBaseYDBURI(tb testtb.TB, ctx context.Context, baseURI string) string {
 	return baseURI
 }
 
-// TestYDBURI returns YDB URI with test-specific database.
+// TestYdbDirectory returns YDB URI with test-specific database.
 // It will be created before test and dropped after unless test fails.
-func TestYDBURI(tb testtb.TB, ctx context.Context, baseURI string) string {
+func TestYdbDirectory(tb testtb.TB, baseURI string) string {
 	tb.Helper()
 
 	if testing.Short() {
@@ -38,10 +35,10 @@ func TestYDBURI(tb testtb.TB, ctx context.Context, baseURI string) string {
 	u, err := url.Parse(baseURI)
 	require.NoError(tb, err)
 
+	require.True(tb, u.Path != "")
 	require.True(tb, u.Opaque == "")
 
 	name := DirectoryName(tb)
-	fullName := filepath.Join(u.Path, name)
 
-	return fullName
+	return name
 }

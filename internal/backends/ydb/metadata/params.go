@@ -8,3 +8,12 @@ type CollectionCreateParams struct {
 	CappedDocuments int64
 	_               struct{} // prevent unkeyed literals
 }
+
+type SelectParams struct {
+	Schema  string
+	Table   string
+	Comment string
+
+	Capped        bool
+	OnlyRecordIDs bool
+}

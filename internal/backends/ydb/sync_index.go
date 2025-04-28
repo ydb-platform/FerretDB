@@ -3,59 +3,48 @@ package ydb
 import (
 	"fmt"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
+	"github.com/FerretDB/FerretDB/internal/handler/sjson"
 	"github.com/FerretDB/FerretDB/internal/types"
-	"strings"
 )
 
-func extractIndexFields(doc *types.Document, indexes metadata.Indexes) []metadata.IndexColumn {
-	docFields := doc.Keys()
-	fieldSet := make(map[string]struct{}, len(docFields))
-	for _, f := range docFields {
-		fieldSet[f] = struct{}{}
-	}
-
-	var extraFields []metadata.IndexColumn
+func extractIndexFields(doc *types.Document, indexes metadata.Indexes) map[string]metadata.IndexColumn {
+	extraColumns := map[string]metadata.IndexColumn{}
 	for _, index := range indexes {
+		if index.Name == fmt.Sprintf("_%s_", metadata.DefaultIDColumn) {
+			continue
+		}
 		for _, pair := range index.Key {
-			val, _ := doc.Get(pair.Field)
-			_, exists := fieldSet[pair.Field]
-			if !exists {
-				val = nil
+			path, err := types.NewPathFromString(pair.Field)
+			if err != nil {
+				continue
 			}
-			extraFields = append(extraFields, metadata.IndexColumn{
-				ColumnName:  pair.Field,
-				ColumnType:  pair.YdbType,
+
+			has := doc.HasByPath(path)
+			if !has {
+				continue
+			}
+
+			val, err := doc.GetByPath(path)
+			if err != nil {
+				continue
+			}
+
+			bsonType := sjson.GetTypeOfValue(val)
+			ydbType := metadata.MapBSONTypeToYDBType(bsonType)
+
+			if ydbType == nil {
+				continue
+			}
+
+			columnName := fmt.Sprintf("%s_%s", metadata.CleanColumnName(pair.Field), bsonType)
+			extraColumns[columnName] = metadata.IndexColumn{
+				ColumnName:  columnName,
+				BsonType:    bsonType,
+				ColumnType:  ydbType.String(),
 				ColumnValue: val,
-			})
-		}
-	}
-	return extraFields
-}
-
-func buildUpsertQuery(pathPrefix, tableName string, indexes metadata.Indexes) string {
-	var fieldDecls = []string{"id: String", "_jsonb: JsonDocument"}
-	var selectFields = []string{"id", "_jsonb"}
-
-	for _, index := range indexes {
-		for _, pair := range index.Key {
-			fieldDecls = append(fieldDecls, fmt.Sprintf("%s: %s", pair.Field, pair.YdbType))
-			selectFields = append(selectFields, pair.Field)
+			}
 		}
 	}
 
-	return fmt.Sprintf(`
-		PRAGMA TablePathPrefix("%s");
-
-		DECLARE $insertData AS List<Struct<
-		%s>>;
-
-		UPSERT INTO %s
-		SELECT
-		%s
-		FROM AS_TABLE($insertData);
-	`, pathPrefix,
-		strings.Join(fieldDecls, ",\n"),
-		tableName,
-		strings.Join(selectFields, ",\n"),
-	)
+	return extraColumns
 }

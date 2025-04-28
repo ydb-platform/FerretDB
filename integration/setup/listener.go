@@ -182,7 +182,7 @@ func setupListener(tb testtb.TB, ctx context.Context, logger *slog.Logger, opts 
 	// use per-test YDB database to prevent problems with parallel tests
 	ydbURL := *ydbURLF
 	if ydbURL != "" {
-		ydbURL = testutil.TestYDBURI(tb, ctx, ydbURL)
+		ydbURL = testutil.TestBaseYdbURI(tb, ydbURL)
 	}
 
 	sp, err := state.NewProvider("")

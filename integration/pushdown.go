@@ -66,6 +66,9 @@ func (res resultPushdown) pushdownExpected(t testtb.TB) bool {
 		return false
 	case setup.IsHana(t):
 		return false
+	case setup.IsYDB(t):
+		return false
+
 	default:
 		panic("Unknown backend")
 	}

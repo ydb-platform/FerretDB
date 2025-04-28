@@ -6,18 +6,19 @@ import (
 	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata/transaction"
-	"github.com/FerretDB/FerretDB/internal/handler/sjson"
 	"github.com/FerretDB/FerretDB/internal/types"
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/must"
+	"github.com/ydb-platform/ydb-go-genproto/protos/Ydb"
 	"github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
+	"path"
 	"sort"
 	"strings"
-	"text/template"
 )
 
 // collection implements backends.Collection interface.
@@ -38,12 +39,12 @@ func newCollection(r *metadata.Registry, dbName, name string) backends.Collectio
 
 // Query implements backends.Collection interface.
 func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*backends.QueryResult, error) {
-	ydbPath := c.r.DbMapping[c.dbName]
-
 	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
+
+	ydbPath := c.r.DbMapping[c.dbName]
 
 	if p == nil {
 		return &backends.QueryResult{
@@ -62,7 +63,7 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 		}, nil
 	}
 
-	q := PrepareSelectClause(&SelectParams{
+	q := PrepareSelectClause(&metadata.SelectParams{
 		Schema:        c.dbName,
 		Table:         meta.TableName,
 		Comment:       params.Comment,
@@ -70,24 +71,35 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 		OnlyRecordIDs: params.OnlyRecordIDs,
 	})
 
-	where, args, err := prepareWhereClause(params.Filter)
+	where, args, useIndex, typePatch, err := prepareWhereClause(params.Filter, meta)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	var declareParts []string
-	for _, param := range *args {
-		paramName := param.Name()
-		paramValue := param.Value()
-		declareParts = append(declareParts, fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String()))
+	if useIndex.use {
+		q = fmt.Sprintf("%s VIEW %s", q, useIndex.idxName)
 	}
 
+	if useIndex.use && typePatch.fieldPath != "" {
+		newWhere, err := transformCondition(where, typePatch.fieldPath, typePatch.scalarType)
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+		where = newWhere
+	}
+
+	var declareParts []string
 	if len(*args) > 0 {
-		q += where
+		q += " WHERE " + where
+		for _, param := range *args {
+			paramName := param.Name()
+			paramValue := param.Value()
+			declareParts = append(declareParts, fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String()))
+		}
 	}
 
 	if len(declareParts) > 0 {
-		q = fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n%s\n%s", ydbPath, strings.Join(declareParts, "\n"), q)
+		q = fmt.Sprintf("\n%s\n%s", strings.Join(declareParts, "\n"), q)
 	}
 
 	q = fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n%s", ydbPath, q)
@@ -96,7 +108,7 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 	q += sort
 
 	if params.Limit != 0 {
-		q += fmt.Sprintf(` LIMIT %s`, params.Limit)
+		q += fmt.Sprintf(` LIMIT %d`, params.Limit)
 	}
 
 	var res result.Result
@@ -153,7 +165,7 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 
 	res := new(backends.ExplainResult)
 
-	opts := &SelectParams{
+	opts := &metadata.SelectParams{
 		Schema: c.dbName,
 		Table:  meta.TableName,
 		Capped: meta.Capped(),
@@ -211,35 +223,29 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 	}
 
 	docs := params.Docs
-	var allCollectionData []ydbTypes.Value
-	indexes := meta.Indexes
+	documentsData := make([]ydbTypes.Value, 0, len(docs))
 
+	var extraColumns map[string]metadata.IndexColumn
 	for len(docs) > 0 {
 		i := min(batchSize, len(docs))
 		batch, rest := docs[:i], docs[i:]
 
 		for _, doc := range batch {
-			var b []byte
-			if b, err = sjson.Marshal(doc); err != nil {
-				return nil, lazyerrors.Error(err)
-			}
-
-			id := GetId(doc)
-			extraFields := extractIndexFields(doc, indexes)
-			allCollectionData = append(allCollectionData, Data(id, b, extraFields))
+			extraColumns = extractIndexFields(doc, meta.Indexes)
+			documentsData = append(documentsData, SingleDocumentData(doc, extraColumns, meta.Capped()))
 		}
 
 		docs = rest
 	}
 
-	q := buildUpsertQuery(ydbPath, meta.TableName, indexes)
+	q := buildInsertQuery(ydbPath, meta.TableName, meta.Capped(), extraColumns)
 
 	err = c.r.D.Driver.Table().DoTx(
 		ctx,
 		func(ctx context.Context, tx table.TransactionActor) (err error) {
 
 			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
-				table.ValueParam("$insertData", ydbTypes.ListValue(allCollectionData...))),
+				table.ValueParam("$insertData", ydbTypes.ListValue(documentsData...))),
 			)
 			if err != nil {
 				return err
@@ -247,10 +253,15 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 			if err = res.Err(); err != nil {
 				return err
 			}
+
 			return res.Close()
-		}, table.WithIdempotent(),
+		},
 	)
+
 	if err != nil {
+		if ydb.IsOperationError(err, Ydb.StatusIds_PRECONDITION_FAILED) {
+			return nil, backends.NewError(backends.ErrorCodeInsertDuplicateID, err)
+		}
 		return nil, lazyerrors.Error(err)
 	}
 
@@ -259,57 +270,54 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 
 // DeleteAll implements backends.Collection interface.
 func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllParams) (*backends.DeleteAllResult, error) {
-	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
-	if err != nil {
+	dbMeta, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	switch {
+	case err != nil:
 		return nil, lazyerrors.Error(err)
-	}
-
-	if p == nil {
+	case dbMeta == nil:
 		return &backends.DeleteAllResult{Deleted: 0}, nil
 	}
 
-	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
-	if err != nil {
+	colMeta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	switch {
+	case err != nil:
 		return nil, lazyerrors.Error(err)
-	}
-
-	if meta == nil {
+	case colMeta == nil:
 		return &backends.DeleteAllResult{Deleted: 0}, nil
 	}
 
-	var IDs []ydbTypes.Value
-	for _, id := range params.IDs {
-		IDs = append(IDs, ydbTypes.BytesValueFromString(getIdFromAny(id)))
-	}
-
+	ids := prepareIDs(params)
 	ydbPath := c.r.DbMapping[c.dbName]
 
-	var (
-		res          result.Result
-		deletedCount uint64
-	)
+	config := metadata.NewDeleteConfig(ydbPath, colMeta.TableName, params)
+
+	q, err := metadata.Render(metadata.DeleteTmpl, config)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	var deletedCount uint64
 
 	err = c.r.D.Driver.Table().DoTx(ctx,
 		func(ctx context.Context, tx table.TransactionActor) (err error) {
-
-			q := template.Must(template.New("delete").Parse(metadata.DeleteTemplate))
-
-			res, err = tx.Execute(ctx, Render(q, TemplateConfig{
-				TablePathPrefix: ydbPath,
-				TableName:       meta.TableName,
-			}), table.NewQueryParameters(
-				table.ValueParam("$IDs", ydbTypes.ListValue(IDs...)),
+			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
+				table.ValueParam("$IDs", ydbTypes.ListValue(ids...)),
 			))
+
 			if err != nil {
 				return err
 			}
+			defer func() {
+				_ = res.Close()
+			}()
+
 			if err = res.Err(); err != nil {
 				return err
 			}
 
 			err = res.NextResultSetErr(ctx)
 			if err != nil {
-				return lazyerrors.Error(err)
+				return err
 			}
 
 			for res.NextRow() {
@@ -321,10 +329,11 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 				}
 			}
 
-			_ = res.Close()
-
 			return nil
-		}, table.WithIdempotent())
+
+		},
+		table.WithIdempotent(),
+	)
 
 	if err != nil {
 		return nil, lazyerrors.Error(err)
@@ -334,49 +343,40 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 }
 
 func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllParams) (*backends.UpdateAllResult, error) {
-	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
-	if err != nil {
+	dbMeta, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	switch {
+	case err != nil:
 		return nil, lazyerrors.Error(err)
+	case dbMeta == nil:
+		return &backends.UpdateAllResult{}, nil
 	}
 
-	var updateAllResult backends.UpdateAllResult
-	if p == nil {
-		return &updateAllResult, nil
-	}
-
-	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
-	if err != nil {
+	colMeta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	switch {
+	case err != nil:
 		return nil, lazyerrors.Error(err)
-	}
-
-	if meta == nil {
-		return &updateAllResult, nil
+	case colMeta == nil:
+		return &backends.UpdateAllResult{}, nil
 	}
 
 	ydbPath := c.r.DbMapping[c.dbName]
-	indexes := meta.Indexes
 
-	var collectionData []ydbTypes.Value
+	docs := params.Docs
+	documentsData := make([]ydbTypes.Value, 0, len(docs))
 
-	for _, doc := range params.Docs {
-		var b []byte
-		if b, err = sjson.Marshal(doc); err != nil {
-			return nil, lazyerrors.Error(err)
-		}
-
-		id := GetId(doc)
-		extraFields := extractIndexFields(doc, indexes)
-		collectionData = append(collectionData, Data(id, b, extraFields))
+	extraColumns := make(map[string]metadata.IndexColumn)
+	for _, doc := range docs {
+		extraColumns = extractIndexFields(doc, colMeta.Indexes)
+		documentsData = append(documentsData, SingleDocumentData(doc, extraColumns, colMeta.Capped()))
 	}
 
-	q := buildUpsertQuery(ydbPath, meta.TableName, indexes)
+	q := buildUpsertQuery(ydbPath, colMeta.TableName, extraColumns)
 
 	err = c.r.D.Driver.Table().DoTx(
 		ctx,
 		func(ctx context.Context, tx table.TransactionActor) (err error) {
-
 			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
-				table.ValueParam("$insertData", ydbTypes.ListValue(collectionData...))),
+				table.ValueParam("$insertData", ydbTypes.ListValue(documentsData...))),
 			)
 			if err != nil {
 				return err
@@ -385,16 +385,15 @@ func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllPa
 				return err
 			}
 
-			updateAllResult.Updated = int32(res.ResultSetCount())
-
 			return res.Close()
-		}, table.WithIdempotent(),
+		},
+		table.WithIdempotent(),
 	)
 	if err != nil {
-		fmt.Printf("unexpected error: %v", err)
+		return nil, lazyerrors.Error(err)
 	}
 
-	return &updateAllResult, nil
+	return new(backends.UpdateAllResult), nil
 }
 
 // Stats implements backends.Collection interface.
@@ -405,7 +404,10 @@ func (c *collection) Stats(ctx context.Context, params *backends.CollectionStats
 	}
 
 	if p == nil {
-		return nil, backends.NewError(backends.ErrorCodeDatabaseDoesNotExist, lazyerrors.Errorf("no database %s", c.dbName))
+		return nil, backends.NewError(
+			backends.ErrorCodeCollectionDoesNotExist,
+			lazyerrors.Errorf("no ns %s.%s", c.dbName, c.name),
+		)
 	}
 
 	coll, err := c.r.CollectionGet(ctx, c.dbName, c.name)
@@ -420,7 +422,9 @@ func (c *collection) Stats(ctx context.Context, params *backends.CollectionStats
 		)
 	}
 
-	stats, err := collectionsStats(ctx, c.r.D.Driver, c.dbName, coll, params.Refresh)
+	ydbPath := c.r.DbMapping[c.dbName]
+
+	stats, err := collectionsStats(ctx, c.r.D.Driver, ydbPath, coll, params.Refresh)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
@@ -444,42 +448,29 @@ func (c *collection) Stats(ctx context.Context, params *backends.CollectionStats
 	}, nil
 }
 
-func collectionsStats(ctx context.Context, driver *ydb.Driver, dbName string, coll *metadata.Collection, refresh bool) (*stats, error) {
-	var sizeTables, countDocuments int64
+func collectionsStats(ctx context.Context, driver *ydb.Driver, ydbPath string, coll *metadata.Collection, refresh bool) (*stats, error) {
+	var sizeTables, countDocuments, sizeIndexes, sizeFreeStorage int64
 	if refresh {
-		statsQuery := fmt.Sprintf(`
-				PRAGMA TablePathPrefix("%v");
-				ANALYZE %s;
-			`, dbName, coll.TableName)
-
 		err := driver.Table().Do(ctx,
-			func(ctx context.Context, s table.Session) (err error) {
-				_, res, err := s.Execute(ctx, transaction.ReadTx, statsQuery, table.NewQueryParameters())
+			func(ctx context.Context, s table.Session) error {
+				desc, err := s.DescribeTable(ctx, path.Join(ydbPath, coll.TableName), options.WithTableStats())
 				if err != nil {
 					return err
 				}
 
-				defer func() {
-					_ = res.Close()
-				}()
+				countDocuments = int64(desc.Stats.RowsEstimate)
+				sizeIndexes = int64(len(desc.Indexes))
+				sizeTables = int64(desc.Stats.StoreSize)
+				sizeFreeStorage = int64(desc.Stats.StoreSize)
 
-				if !res.NextResultSet(ctx) || !res.NextRow() {
-					return fmt.Errorf("failed to get collection stats")
-				}
-
-				if err = res.Scan(&sizeTables, &countDocuments); err != nil {
-					return err
-				}
-				return err
-			})
+				return nil
+			},
+		)
 
 		if err != nil {
-			fmt.Printf("Failed to fill table with insertData: %v\n", err)
+			return nil, lazyerrors.Error(err)
 		}
 	}
-
-	var sizeIndexes int64 = 0
-	var sizeFreeStorage int64 = 0
 
 	return &stats{
 		countDocuments:  countDocuments,
@@ -579,6 +570,23 @@ func (c *collection) DropIndexes(ctx context.Context, params *backends.DropIndex
 // Compact implements backends.Collection interface.
 func (c *collection) Compact(ctx context.Context, params *backends.CompactParams) (*backends.CompactResult, error) {
 	return new(backends.CompactResult), nil
+}
+
+func prepareIDs(params *backends.DeleteAllParams) []ydbTypes.Value {
+	var ids []ydbTypes.Value
+	if params.RecordIDs == nil {
+		ids = make([]ydbTypes.Value, 0, len(params.IDs))
+		for _, id := range params.IDs {
+			ids = append(ids, ydbTypes.BytesValueFromString(getIdFromAny(id)))
+		}
+	} else {
+		ids = make([]ydbTypes.Value, 0, len(params.RecordIDs))
+		for _, id := range params.RecordIDs {
+			ids = append(ids, ydbTypes.Int64Value(id))
+		}
+	}
+
+	return ids
 }
 
 // check interfaces

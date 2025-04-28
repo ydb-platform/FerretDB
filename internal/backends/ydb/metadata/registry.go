@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata/transaction"
+	"github.com/FerretDB/FerretDB/internal/util/must"
 	"github.com/FerretDB/FerretDB/internal/util/resource"
 	"github.com/ydb-platform/ydb-go-sdk/v3/sugar"
+	"hash/fnv"
 	"log/slog"
 	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"golang.org/x/exp/maps"
@@ -33,7 +35,12 @@ import (
 const (
 	// YDB table name where FerretDB metadata is stored.
 	metadataTableName = backends.ReservedPrefix + "database_metadata"
+
+	maxObjectNameLength = 255
 )
+
+// specialCharacters are unsupported characters of YDB scheme object name that are replaced with `_`.
+var specialCharacters = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 // Parts of Prometheus metric names.
 const (
@@ -121,18 +128,13 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) (string, err
 				jsonData string
 			)
 
-			q := template.Must(template.New("select").Parse(SelectMetadataTemplate))
+			q, _ := Render(SelectMetadataTmpl, TemplateConfig{
+				TablePathPrefix: ydbPath,
+				TableName:       metadataTableName,
+				ColumnName:      DefaultColumn,
+			})
 
-			_, res, err = s.Execute(
-				ctx,
-				transaction.ReadTx,
-				render(q, TemplateConfig{
-					TablePathPrefix: ydbPath,
-					TableName:       metadataTableName,
-					ColumnName:      DefaultColumn,
-				}),
-				table.NewQueryParameters(),
-			)
+			_, res, err = s.Execute(ctx, transaction.ReadTx, q, table.NewQueryParameters())
 
 			if err != nil {
 				return lazyerrors.Error(err)
@@ -189,6 +191,7 @@ func (r *Registry) initDirectory(ctx context.Context, ydbPath string) error {
 			return lazyerrors.Error(err)
 		}
 	}
+
 	return nil
 }
 
@@ -228,12 +231,12 @@ func (r *Registry) DatabaseGetExisting(ctx context.Context, dbName string) (map[
 	return db, nil
 }
 
-// DatabaseGetOrCreate returns a connection to existing database or newly created database.
+// MetadataGetOrCreate returns a connection to existing database or newly created database.
 //
 // The dbName must be a validated database name.
 //
 // If the user is not authenticated, it returns error.
-func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error {
+func (r *Registry) MetadataGetOrCreate(ctx context.Context, dbName string) error {
 	if _, err := r.LoadMetadata(ctx, dbName); err != nil {
 		return lazyerrors.Error(err)
 	}
@@ -241,7 +244,7 @@ func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error
 	r.rw.Lock()
 	defer r.rw.Unlock()
 
-	return r.databaseGetOrCreate(ctx, dbName)
+	return r.metadataGetOrCreate(ctx, dbName)
 }
 
 // databaseGet returns a connection to existing database
@@ -249,7 +252,7 @@ func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error
 // The dbName must be a validated database name.
 //
 // It does not hold the lock.
-func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error {
+func (r *Registry) metadataGetOrCreate(ctx context.Context, dbName string) error {
 	db := r.colls[dbName]
 	if db != nil {
 		return nil
@@ -260,9 +263,9 @@ func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error
 	err := r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			return s.CreateTable(ctx, path.Join(ydbPath, metadataTableName),
-				options.WithColumn("meta_id", ydbTypes.TypeUUID),
-				options.WithColumn(DefaultColumn, ydbTypes.Optional(ydbTypes.TypeJSONDocument)),
-				options.WithPrimaryKeyColumn("meta_id"),
+				options.WithColumn(DefaultIDColumn, ydbTypes.TypeUUID),
+				options.WithColumn(DefaultColumn, ydbTypes.Optional(ydbTypes.TypeJSON)),
+				options.WithPrimaryKeyColumn(DefaultIDColumn),
 			)
 		})
 
@@ -309,79 +312,28 @@ func (r *Registry) CollectionCreate(ctx context.Context, params *CollectionCreat
 // It does not hold the lock.
 func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreateParams) (bool, error) {
 	collectionName := params.Name
-	ydbPath := r.DbMapping[params.DBName]
+	ydbPath, exists := r.DbMapping[params.DBName]
+	if !exists {
+		return false, lazyerrors.Errorf("target backend scheme object not found for %q", params.DBName)
+	}
 
-	err := r.databaseGetOrCreate(ctx, params.DBName)
+	err := r.metadataGetOrCreate(ctx, params.DBName)
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	colls := r.colls[params.DBName]
-	if colls != nil && colls[collectionName] != nil {
+	if r.collectionExists(params.DBName, params.Name) {
 		return false, nil
 	}
 
-	id := uuid.New()
-	tableName := collectionName
-	c := &Collection{
-		Name:      collectionName,
-		UUID:      id.String(),
-		TableName: tableName,
-		Settings: Settings{
-			CappedSize:      params.CappedSize,
-			CappedDocuments: params.CappedDocuments,
-		},
-	}
+	tableName := r.generateUniqueTableName(params.DBName, params.Name)
 
-	jsonData, err := json.Marshal(c)
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal collection data: %v", err)
-	}
-
-	columns := []options.CreateTableOption{
-		options.WithColumn(DefaultColumn, ydbTypes.Optional(ydbTypes.TypeJSONDocument)),
-	}
-
-	var primaryKey string
-
-	if params.Capped() {
-		columns = append(columns, options.WithColumn(RecordIDColumn, ydbTypes.TypeUUID))
-		primaryKey = RecordIDColumn
-	}
-	columns = append(columns, options.WithColumn("id", ydbTypes.TypeString))
-	primaryKey = "id"
-
-	err = r.D.Driver.Table().Do(ctx,
-		func(ctx context.Context, s table.Session) (err error) {
-			return s.CreateTable(ctx, path.Join(ydbPath, tableName),
-				append(columns, options.WithPrimaryKeyColumn(primaryKey))...,
-			)
-		})
-
+	err = r.createTable(ctx, ydbPath, tableName, params.Capped())
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	q := fmt.Sprintf(`
-		PRAGMA TablePathPrefix("%v");
-
-		DECLARE $meta_id as Uuid;
-		DECLARE $json as JsonDocument;
-
-		REPLACE INTO %s (meta_id, _jsonb)
-		VALUES ($meta_id, $json);
-		`, ydbPath, metadataTableName)
-
-	err = r.D.Driver.Table().Do(ctx,
-		func(ctx context.Context, s table.Session) (err error) {
-			_, _, err = s.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
-				table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-				table.ValueParam("$json", ydbTypes.JSONDocumentValueFromBytes(jsonData)),
-			))
-
-			return err
-		})
-
+	collection, err := r.storeCollectionMetadata(ctx, params, ydbPath, tableName)
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
@@ -389,7 +341,7 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 	if r.colls[params.DBName] == nil {
 		r.colls[params.DBName] = map[string]*Collection{}
 	}
-	r.colls[params.DBName][collectionName] = c
+	r.colls[params.DBName][collectionName] = collection
 
 	return true, nil
 }
@@ -488,41 +440,47 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 		return false, nil
 	}
 
-	ydbPath := r.DbMapping[dbName]
-	id := uuid.MustParse(c.UUID)
-	err := r.D.Driver.Table().Do(ctx,
-		func(ctx context.Context, s table.Session) error {
-			return s.DropTable(ctx, path.Join(ydbPath, c.TableName))
-		})
-
+	id, err := uuid.Parse(c.UUID)
 	if err != nil {
-		fmt.Printf("Failed to drop table: %v\n", err)
-		return false, err
+		return false, lazyerrors.Error(err)
 	}
 
-	q := fmt.Sprintf(
-		DeleteFromMetadataTemplate,
-		ydbPath,
-		metadataTableName,
-	)
+	ydbPath := r.DbMapping[dbName]
 
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) error {
-			_, _, err := s.Execute(
-				ctx,
-				transaction.WriteTx,
-				q,
-				table.NewQueryParameters(table.ValueParam("$meta_id", ydbTypes.UuidValue(id))))
+			return s.DropTable(ctx, path.Join(ydbPath, c.TableName))
+		},
+	)
 
+	if err != nil {
+		return false, lazyerrors.Error(err)
+	}
+
+	err = r.D.Driver.Table().Do(ctx,
+		func(ctx context.Context, s table.Session) error {
+			q, _ := Render(DeleteFromMetadataTmpl, ReplaceIntoMetadataConfig{
+				TablePathPrefix: ydbPath,
+				TableName:       metadataTableName,
+			})
+
+			_, res, err := s.Execute(ctx, transaction.WriteTx, q,
+				table.NewQueryParameters(table.ValueParam("$meta_id", ydbTypes.UuidValue(id))))
 			if err != nil {
 				return err
 			}
-			return err
-		})
+
+			err = res.Err()
+			if err != nil {
+				return err
+			}
+
+			return res.Close()
+		},
+	)
 
 	if err != nil {
-		fmt.Printf("Failed to delete info from metadata table: %v\n", err)
-		return false, err
+		return false, lazyerrors.Error(err)
 	}
 
 	delete(r.colls[dbName], collectionName)
@@ -564,11 +522,11 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 		return false, lazyerrors.Error(err)
 	}
 
-	q := fmt.Sprintf(
-		ReplaceIntoMetadataTemplate,
-		ydbPath,
-		metadataTableName,
-	)
+	q, _ := Render(UpdateMedataTmpl, ReplaceIntoMetadataConfig{
+		TablePathPrefix: ydbPath,
+		TableName:       metadataTableName,
+	})
+
 	id := uuid.MustParse(c.UUID)
 
 	err = r.D.Driver.Table().Do(ctx,
@@ -579,7 +537,7 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 				q,
 				table.NewQueryParameters(
 					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-					table.ValueParam("$json", ydbTypes.JSONDocumentValueFromBytes(b)),
+					table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
 				))
 			return err
 		})
@@ -593,6 +551,11 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 
 	return true, nil
 }
+
+//func (r *Registry) handleUniqueIndex(ctx context.Context, dbName, collectionName string, index IndexInfo) error {
+//
+//	return nil
+//}
 
 // IndexesCreate creates indexes in the collection.
 //
@@ -641,44 +604,52 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 
 	created := make([]string, 0, len(indexes))
 	ydbPath := r.DbMapping[dbName]
+	fields := map[string]string{}
 
 	for _, index := range indexes {
 		if coll, ok := allIndexes[index.Name]; ok && coll == collectionName {
 			continue
 		}
 
+		supported := SupportedIndexTypes()
+		definedOrder := GetColumnsInDefinedOrder()
+		columnNames := make([]string, 0, len(supported))
 		for i := range index.Key {
 			field := index.Key[i].Field
 
-			jsonData, err := SelectJsonField(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field)
+			if _, exists := fields[field]; exists {
+				continue
+			}
+
+			if strings.Contains(field, ".") {
+				field = strings.ReplaceAll(field, ".", "")
+			}
+
+			columns := make([]options.AlterTableOption, 0, len(supported))
+			for _, bsonType := range definedOrder {
+				if t, ok := supported[bsonType]; ok {
+					columnName := fmt.Sprintf("%s_%s", field, bsonType)
+					columns = append(columns, options.WithAddColumn(columnName, ydbTypes.Optional(t)))
+					columnNames = append(columnNames, columnName)
+				}
+			}
+
+			err = addFieldColumns(ctx, r.D.Driver.Table(), ydbPath, c.TableName, columns)
 			if err != nil {
 				return lazyerrors.Error(err)
 			}
 
-			columnType, err := detectJsonFieldType(jsonData, field)
-			if err != nil {
-				return lazyerrors.Error(err)
-			}
-
-			index.Key[i].YdbType = columnType.String()
-
-			err = addFieldColumn(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field, columnType)
-			if err != nil {
-				return lazyerrors.Error(err)
-			}
-
-			err = updateColumnWithExistingValues(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field, columnType)
-			if err != nil {
-				return lazyerrors.Error(err)
-			}
-
-			err = addIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, field)
-			if err != nil {
-				return lazyerrors.Error(err)
-			}
-
+			fields[field] = index.Name
 		}
 
+		if len(columnNames) > 0 {
+			err = addIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, columnNames, index.Name)
+			if err != nil {
+				return lazyerrors.Error(err)
+			}
+		}
+
+		index.Ready = false
 		created = append(created, index.Name)
 		c.Indexes = append(c.Indexes, index)
 		allIndexes[index.Name] = collectionName
@@ -689,13 +660,12 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		return lazyerrors.Error(err)
 	}
 
-	q := fmt.Sprintf(
-		ReplaceIntoMetadataTemplate,
-		ydbPath,
-		metadataTableName,
-	)
-	id := uuid.MustParse(c.UUID)
+	q, _ := Render(UpdateMedataTmpl, ReplaceIntoMetadataConfig{
+		TablePathPrefix: ydbPath,
+		TableName:       metadataTableName,
+	})
 
+	id := uuid.MustParse(c.UUID)
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			_, _, err = s.Execute(
@@ -704,7 +674,7 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 				q,
 				table.NewQueryParameters(
 					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-					table.ValueParam("$json", ydbTypes.JSONDocumentValueFromBytes(b)),
+					table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
 				))
 			return err
 		})
@@ -714,6 +684,50 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 	}
 
 	r.colls[dbName][collectionName] = c
+
+	for _, index := range indexes {
+		go func(index IndexInfo, coll *Collection, ydbPath string) {
+			childCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			err := migrateIndexData(childCtx, r.D.Driver.Table(), ydbPath, coll.TableName, index.Key)
+			if err != nil {
+				fmt.Printf("index migration failed: %v\n", err)
+				return
+			}
+			for i := range coll.Indexes {
+				if coll.Indexes[i].Name == index.Name {
+					coll.Indexes[i].Ready = true
+				}
+			}
+
+			b, err := json.Marshal(coll)
+			if err != nil {
+				fmt.Printf("index migration marshal error: %v\n", err)
+				return
+			}
+
+			q, _ := Render(UpdateMedataTmpl, ReplaceIntoMetadataConfig{
+				TablePathPrefix: ydbPath,
+				TableName:       metadataTableName,
+			})
+
+			id := uuid.MustParse(coll.UUID)
+
+			_ = r.D.Driver.Table().Do(childCtx, func(ctx context.Context, s table.Session) error {
+				_, _, err := s.Execute(
+					ctx,
+					transaction.WriteTx,
+					q,
+					table.NewQueryParameters(
+						table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
+						table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
+					))
+				return err
+			})
+
+		}(index, c, ydbPath)
+	}
 
 	return nil
 }
@@ -744,36 +758,53 @@ func (r *Registry) IndexesDrop(ctx context.Context, dbName, collectionName strin
 // If database or collection does not exist, nil is returned.
 //
 // It does not hold the lock.
-func (r *Registry) indexesDrop(
-	ctx context.Context,
-	dbName,
-	collectionName string,
-	indexNames []string,
-	ydbPath string) error {
+func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName string, indexNames []string, ydbPath string) error {
 	c := r.collectionGet(dbName, collectionName)
 	if c == nil {
 		return nil
 	}
 
+	fieldsPlanToDelete := make(map[string]struct{})
 	for _, name := range indexNames {
 		i := slices.IndexFunc(c.Indexes, func(i IndexInfo) bool { return name == i.Name })
 		if i < 0 {
 			continue
 		}
 
-		idx := strings.Index(name, "_")
-		name = name[:idx]
 		err := dropIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, name)
 		if err != nil {
 			return lazyerrors.Error(err)
 		}
 
-		err = dropFieldColumn(ctx, r.D.Driver.Table(), ydbPath, c.TableName, name)
-		if err != nil {
-			return lazyerrors.Error(err)
+		index := c.Indexes[i]
+		for _, pair := range index.Key {
+			fieldsPlanToDelete[pair.Field] = struct{}{}
 		}
 
 		c.Indexes = slices.Delete(c.Indexes, i, i+1)
+	}
+
+	for _, info := range c.Indexes {
+		for _, pair := range info.Key {
+			if _, ok := fieldsPlanToDelete[pair.Field]; ok {
+				delete(fieldsPlanToDelete, pair.Field)
+			}
+		}
+	}
+
+	supported := SupportedIndexTypes()
+	columns := make([]options.AlterTableOption, 0, len(supported))
+	for field := range fieldsPlanToDelete {
+		fieldName := strings.ReplaceAll(field, ".", "")
+		for b, _ := range supported {
+			columnName := fmt.Sprintf("%s_%s", fieldName, b)
+			columns = append(columns, options.WithDropColumn(columnName))
+		}
+	}
+
+	err := dropFieldColumns(ctx, r.D.Driver.Table(), ydbPath, c.TableName, columns)
+	if err != nil {
+		return lazyerrors.Error(err)
 	}
 
 	id := uuid.MustParse(c.UUID)
@@ -782,11 +813,10 @@ func (r *Registry) indexesDrop(
 		return lazyerrors.Error(err)
 	}
 
-	q := fmt.Sprintf(
-		ReplaceIntoMetadataTemplate,
-		ydbPath,
-		metadataTableName,
-	)
+	q, _ := Render(UpdateMedataTmpl, ReplaceIntoMetadataConfig{
+		TablePathPrefix: ydbPath,
+		TableName:       metadataTableName,
+	})
 
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
@@ -796,7 +826,7 @@ func (r *Registry) indexesDrop(
 				q,
 				table.NewQueryParameters(
 					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-					table.ValueParam("$json", ydbTypes.JSONDocumentValueFromBytes(b)),
+					table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
 				))
 			return err
 		})
@@ -882,6 +912,108 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 			db,
 		)
 	}
+}
+
+func (r *Registry) createTable(ctx context.Context, ydbPath, tableName string, isCapped bool) error {
+	columns := []options.CreateTableOption{
+		options.WithColumn(DefaultColumn, ydbTypes.Optional(ydbTypes.TypeJSON)),
+		options.WithColumn(DefaultIDColumn, ydbTypes.TypeString),
+	}
+
+	if isCapped {
+		columns = append(columns, options.WithColumn(RecordIDColumn, ydbTypes.TypeInt64))
+	}
+
+	return r.D.Driver.Table().Do(ctx, func(ctx context.Context, s table.Session) error {
+		return s.CreateTable(ctx, path.Join(ydbPath, tableName),
+			append(columns, options.WithPrimaryKeyColumn(DefaultIDColumn))...,
+		)
+	})
+}
+
+func (r *Registry) collectionExists(dbName, collectionName string) bool {
+	colls := r.colls[dbName]
+	return colls != nil && colls[collectionName] != nil
+}
+
+func (r *Registry) generateUniqueTableName(dbName, collectionName string) string {
+	h := fnv.New32a()
+	must.NotFail(h.Write([]byte(collectionName)))
+	s := h.Sum32()
+
+	var tableName string
+	list := maps.Values(r.colls[dbName])
+
+	for {
+		tableName = specialCharacters.ReplaceAllString(strings.ToLower(collectionName), "_")
+
+		suffixHash := fmt.Sprintf("_%08x", s)
+		if l := maxObjectNameLength - len(suffixHash); len(tableName) > l {
+			tableName = tableName[:l]
+		}
+
+		tableName = fmt.Sprintf("%s%s", tableName, suffixHash)
+
+		if !slices.ContainsFunc(list, func(c *Collection) bool { return c.TableName == tableName }) {
+			break
+		}
+
+		// table already exists, generate a new table name by incrementing the hash
+		s++
+	}
+
+	return tableName
+}
+
+func (r *Registry) storeCollectionMetadata(ctx context.Context, params *CollectionCreateParams, ydbPath, tableName string) (*Collection, error) {
+	collection := &Collection{
+		Name:      params.Name,
+		UUID:      uuid.New().String(),
+		TableName: tableName,
+		Indexes: []IndexInfo{
+			{
+				Name:   fmt.Sprintf("_%s_", DefaultIDColumn),
+				Ready:  true,
+				Key:    []IndexKeyPair{{Field: "_id"}},
+				Unique: true,
+			},
+		},
+		Settings: Settings{
+			CappedSize:      params.CappedSize,
+			CappedDocuments: params.CappedDocuments,
+		},
+	}
+
+	jsonData, err := json.Marshal(collection)
+	if err != nil {
+		return nil, err
+	}
+
+	q, _ := Render(UpdateMedataTmpl, ReplaceIntoMetadataConfig{
+		TablePathPrefix: ydbPath,
+		TableName:       metadataTableName,
+	})
+
+	err = r.D.Driver.Table().Do(ctx, func(ctx context.Context, s table.Session) error {
+		_, res, err := s.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
+			table.ValueParam("$meta_id", ydbTypes.UuidValue(uuid.MustParse(collection.UUID))),
+			table.ValueParam("$json", ydbTypes.JSONValueFromBytes(jsonData)),
+		))
+		if err != nil {
+			return err
+		}
+
+		err = res.Err()
+		if err != nil {
+			return err
+		}
+
+		return res.Close()
+	},
+		table.WithIdempotent(),
+	)
+
+	return collection, err
 }
 
 // check interfaces

@@ -2,13 +2,18 @@ package ydb
 
 import (
 	"context"
+	"fmt"
+	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
 	"github.com/FerretDB/FerretDB/internal/handler/sjson"
 	"github.com/FerretDB/FerretDB/internal/types"
 	"github.com/FerretDB/FerretDB/internal/util/iterator"
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/must"
 	"github.com/FerretDB/FerretDB/internal/util/resource"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/indexed"
+	"slices"
 	"sync"
 )
 
@@ -49,7 +54,6 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 	defer iter.m.Unlock()
 
 	var unused struct{}
-	var err error
 
 	// ignore context error, if any, if iterator is already closed
 	if iter.rs == nil {
@@ -73,14 +77,36 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 		return unused, nil, lazyerrors.Error(err)
 	}
 
+	set := iter.rs.CurrentResultSet()
+	columnCount := set.ColumnCount()
+
 	var recordID int64
 	var b []byte
+	var dest []indexed.Required
 
-	if err := iter.rs.ScanWithDefaults(&b); err != nil {
+	columns := make([]string, columnCount)
+	set.Columns(func(col options.Column) {
+		columns = append(columns, col.Name)
+	})
+
+	switch {
+	case slices.Contains(columns, metadata.RecordIDColumn) && slices.Contains(columns, metadata.DefaultColumn):
+		dest = []indexed.Required{&recordID, &b}
+	case slices.Contains(columns, metadata.RecordIDColumn):
+		dest = []indexed.Required{&recordID}
+	case slices.Contains(columns, metadata.DefaultColumn):
+		dest = []indexed.Required{&b}
+	default:
+		panic(fmt.Sprintf("cannot scan unknown columns: %v", columns))
+	}
+
+	defer iter.rs.Close()
+	if err := iter.rs.ScanWithDefaults(dest...); err != nil {
 		iter.close()
 		return unused, nil, lazyerrors.Error(err)
 	}
 
+	var err error
 	doc := must.NotFail(types.NewDocument())
 
 	if !iter.onlyRecordIDs {

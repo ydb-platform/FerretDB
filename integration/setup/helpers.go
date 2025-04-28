@@ -55,6 +55,13 @@ func IsHana(tb testtb.TB) bool {
 	return *targetBackendF == "ferretdb-hana"
 }
 
+// IsYDB returns true if the current test is running for SQLite backend.
+//
+// This function should not be used lightly.
+func IsYDB(tb testtb.TB) bool {
+	return *targetBackendF == "ferretdb-ydb"
+}
+
 // ensureIssueURL panics if URL is not a valid FerretDB issue URL.
 func ensureIssueURL(url string) {
 	must.BeTrue(strings.HasPrefix(url, "https://github.com/FerretDB/FerretDB/issues/"))

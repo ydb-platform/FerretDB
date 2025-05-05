@@ -169,7 +169,7 @@ var hanaFlags struct {
 //
 //nolint:lll // some tags are long
 var ydbFlags struct {
-	YdbURL      string `name:"ydb-url" default:"grpc://127.0.0.1:2136?database=/local" help:"YDB URL for 'ydb' handler."`
+	YdbURL      string `name:"ydb-url" default:"grpc://127.0.0.1:2136/local" help:"YDB URL for 'ydb' handler."`
 	YdbAuth     string `name:"ydb-auth" help:"YDB auth handler."`
 	YdbFilePath string `name:"ydb-file-path" help:"YDB CA path."`
 }

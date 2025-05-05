@@ -165,17 +165,15 @@ func (db *database) Stats(ctx context.Context, params *backends.DatabaseStatsPar
 
 	var totalDocs, totalSizeTables, totalSizeIndexes, totalFreeStorage int64
 
-	for _, coll := range list {
-		stats, err := collectionsStats(ctx, db.r.D.Driver, db.name, coll, params.Refresh)
-		if err != nil {
-			return nil, lazyerrors.Error(err)
-		}
-
-		totalDocs += stats.countDocuments
-		totalSizeTables += stats.sizeTables
-		totalSizeIndexes += stats.sizeIndexes
-		totalFreeStorage += stats.sizeFreeStorage
+	stats, err := collectionsStats(ctx, db.r.D.Driver, db.name, list, params.Refresh)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
 	}
+
+	totalDocs += stats.countDocuments
+	totalSizeTables += stats.sizeTables
+	totalSizeIndexes += stats.sizeIndexes
+	totalFreeStorage += stats.sizeFreeStorage
 
 	return &backends.DatabaseStatsResult{
 		CountDocuments:  totalDocs,

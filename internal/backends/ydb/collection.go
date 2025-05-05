@@ -12,7 +12,6 @@ import (
 	"github.com/ydb-platform/ydb-go-genproto/protos/Ydb"
 	"github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
-	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
@@ -474,18 +473,17 @@ func (c *collection) Stats(ctx context.Context, params *backends.CollectionStats
 
 	ydbPath := c.r.DbMapping[c.dbName]
 
-	stats, err := collectionsStats(ctx, c.r.D.Driver, ydbPath, coll, params.Refresh)
+	stats, err := collectionsStats(ctx, c.r.D.Driver, ydbPath, []*metadata.Collection{coll}, params.Refresh)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	indexMap := map[string]string{}
-	indexSizes := make([]backends.IndexSize, len(indexMap))
-	indexSizes = []backends.IndexSize{
-		{
-			Name: "indexName",
+	indexSizes := make([]backends.IndexSize, len(coll.Indexes))
+	for i, index := range coll.Indexes {
+		indexSizes[i] = backends.IndexSize{
+			Name: index.Name,
 			Size: 0,
-		},
+		}
 	}
 
 	return &backends.CollectionStatsResult{
@@ -498,24 +496,71 @@ func (c *collection) Stats(ctx context.Context, params *backends.CollectionStats
 	}, nil
 }
 
-func collectionsStats(ctx context.Context, driver *ydb.Driver, ydbPath string, coll *metadata.Collection, refresh bool) (*stats, error) {
-	var sizeTables, countDocuments, sizeIndexes, sizeFreeStorage int64
-	if refresh {
+func collectionsStats(ctx context.Context, driver *ydb.Driver, ydbPath string, list []*metadata.Collection, refresh bool) (*stats, error) {
+	if len(list) == 0 {
+		return new(stats), nil
+	}
+
+	var (
+		sizeTables      uint64
+		countDocuments  uint64
+		sizeIndexes     uint64
+		sizeFreeStorage uint64
+	)
+
+	for _, coll := range list {
+		tablePath := path.Join(ydbPath, coll.TableName)
 		err := driver.Table().Do(ctx,
 			func(ctx context.Context, s table.Session) error {
-				desc, err := s.DescribeTable(ctx, path.Join(ydbPath, coll.TableName), options.WithTableStats())
+				q := `
+				DECLARE $tablePath AS Utf8;
+
+				SELECT
+					stats.TableSize,
+					stats.IndexesSize,
+					stats.RowCount,
+					storage.CurrentAvailableSize
+				FROM (
+					SELECT
+						SUM(CASE WHEN Path = $tablePath THEN DataSize ELSE 0 END) AS TableSize,
+						SUM(CASE WHEN Path LIKE $tablePath || '/%%/indexImplTable' THEN DataSize ELSE 0 END) AS IndexesSize,
+						SUM(CASE WHEN Path = $tablePath THEN RowCount ELSE 0 END) AS RowCount
+					FROM ` + "`.sys/partition_stats`" + `
+					WHERE Path = $tablePath OR Path LIKE $tablePath || '/%%/indexImplTable'
+				) AS stats
+				CROSS JOIN (
+					SELECT SUM(CurrentAvailableSize) AS CurrentAvailableSize 
+    				FROM ` + "`.sys/ds_storage_stats`" + `
+				) AS storage;`
+				_, res, err := s.Execute(ctx, transaction.ReadTx, q,
+					table.NewQueryParameters(table.ValueParam("$tablePath", ydbTypes.UTF8Value(tablePath))),
+				)
+
+				if err != nil {
+					return err
+				}
+				defer func() {
+					_ = res.Close()
+				}()
+
+				err = res.NextResultSetErr(ctx)
 				if err != nil {
 					return err
 				}
 
-				countDocuments = int64(desc.Stats.RowsEstimate)
-				sizeIndexes = int64(len(desc.Indexes))
-				sizeTables = int64(desc.Stats.StoreSize)
-				sizeFreeStorage = int64(desc.Stats.StoreSize)
+				for res.NextRow() {
+					if err = res.ScanNamed(
+						named.OptionalWithDefault("stats.TableSize", &sizeTables),
+						named.OptionalWithDefault("stats.IndexesSize", &sizeIndexes),
+						named.OptionalWithDefault("stats.RowCount", &countDocuments),
+						named.OptionalWithDefault("storage.CurrentAvailableSize", &sizeFreeStorage),
+					); err != nil {
+						return err
+					}
+				}
 
 				return nil
-			},
-		)
+			})
 
 		if err != nil {
 			return nil, lazyerrors.Error(err)
@@ -523,10 +568,10 @@ func collectionsStats(ctx context.Context, driver *ydb.Driver, ydbPath string, c
 	}
 
 	return &stats{
-		countDocuments:  countDocuments,
-		sizeIndexes:     sizeIndexes,
-		sizeTables:      sizeTables,
-		sizeFreeStorage: sizeFreeStorage,
+		countDocuments:  int64(countDocuments),
+		sizeIndexes:     int64(sizeIndexes),
+		sizeTables:      int64(sizeTables),
+		sizeFreeStorage: int64(sizeFreeStorage),
 	}, nil
 }
 

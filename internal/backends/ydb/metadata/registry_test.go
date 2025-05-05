@@ -22,7 +22,7 @@ func createDatabase(t *testing.T, ctx context.Context) (*Registry, string) {
 	require.NoError(t, err)
 
 	base := testutil.TestBaseYdbURI(t, "")
-	r, err := NewRegistry(base, 100, testutil.Logger(t), sp)
+	r, err := NewRegistry(base, "", "", 100, testutil.Logger(t), sp)
 	require.NoError(t, err)
 
 	u := testutil.TestYdbDirectory(t, base)
@@ -212,7 +212,7 @@ func TestRenameCollection(t *testing.T) {
 	})
 
 	t.Run("CheckCollectionRenamed", func(t *testing.T) {
-		_, err = r.LoadMetadata(ctx, dbName)
+		err = r.LoadMetadata(ctx, dbName)
 		require.NoError(t, err)
 
 		expected := &Collection{

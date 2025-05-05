@@ -3,9 +3,12 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"github.com/FerretDB/FerretDB/internal/handler/sjson"
+	"github.com/FerretDB/FerretDB/internal/types"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
+	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
 	"math/rand/v2"
 	"path"
 	"regexp"
@@ -92,7 +95,7 @@ func buildTypePath(path string) string {
 	parts := strings.Split(path, ".")
 
 	var sb strings.Builder
-	sb.WriteString(`$`) // стартуем с корня
+	sb.WriteString(`$`)
 
 	for _, part := range parts {
 		sb.WriteString(`.\"$s\".p.`)
@@ -105,117 +108,128 @@ func buildTypePath(path string) string {
 }
 
 func migrateIndexData(ctx context.Context, c table.Client, prefix, tableName string, fieldNames []IndexKeyPair) error {
-	supportedTypes := SupportedIndexTypes()
+	supportedTypes := GetSupportedIndexTypes()
 	var columns []string
 	var casts []string
 	for _, pair := range fieldNames {
 		fieldName := pair.Field
 		typePath := buildTypePath(fieldName)
 		jsonPath := DotNotationToJSONPath(fieldName)
+		fieldName = strings.ReplaceAll(fieldName, ".", "")
+
 		for bson, yType := range supportedTypes {
-			if strings.Contains(fieldName, ".") {
-				fieldName = strings.ReplaceAll(fieldName, ".", "")
-			}
 			colName := fmt.Sprintf("%s_%s", fieldName, bson)
 			columns = append(columns, colName)
+
 			if bson == "double" {
 				casts = append(casts, fmt.Sprintf(`
 					CASE 
-						WHEN val_type = "%s" 
+						WHEN JSON_VALUE(_jsonb, "%s") = "%s" 
 						THEN
 							CASE 
-								WHEN is_min THEN -9223372036854775808
-								WHEN is_max THEN 9223372036854775807
-								ELSE CAST(val as %s)
+								WHEN JSON_EXISTS(_jsonb, '$.%s ? (@ == $min)' PASSING -9223372036854775808 AS "min") THEN -9223372036854775808
+								WHEN JSON_EXISTS(_jsonb, '$.%s ? (@ == $max)' PASSING 9223372036854775807 AS "max") THEN 9223372036854775807
+								ELSE CAST(JSON_VALUE(_jsonb, "$.%s") AS %s)
 							END
 						ELSE NULL
 					END AS %s
-			`, bson, yType.String(), colName))
+			`, typePath, bson, jsonPath, jsonPath, jsonPath, yType.String(), colName))
 			} else {
 				casts = append(casts, fmt.Sprintf(`
 					CASE 
-						WHEN val_type = "%s" 
-						THEN CAST(val AS %s) 
+						WHEN JSON_VALUE(_jsonb, "%s") = "%s" 
+						THEN CAST(JSON_VALUE(_jsonb, "$.%s") AS %s) 
 						ELSE NULL 
 					END AS %s
-			`, bson, yType.String(), colName))
+			`, typePath, bson, jsonPath, yType.String(), colName))
 			}
 		}
+	}
 
-		offset := 0
-		batchSize := 10
+	limit := 100
+	lastId := ""
+	empty := false
 
-		for {
-			q, _ := Render(
-				template.Must(template.New("").
-					Funcs(template.FuncMap{
-						"escapeName": escapeName,
-					}).
-					Parse(`
+	for !empty {
+		q, _ := Render(
+			template.Must(template.New("").
+				Funcs(template.FuncMap{
+					"escapeName": escapeName,
+				}).
+				Parse(`
 					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
 
-					SELECT COUNT(*) AS cnt
-					FROM (
-					  SELECT *
-					  FROM {{ escapeName .TableName }}
-					  LIMIT {{ .Limit }} OFFSET {{ .Offset }}
-					);
+					DECLARE $limit AS Uint64;
+					DECLARE $lastId AS String;
 
-					UPSERT INTO {{ escapeName .TableName }} (id{{ range .Columns }}, {{ . }}{{ end }})
+					UPSERT INTO {{ escapeName .TableName }} (id_hash, id, _jsonb{{ range .Columns }}, {{ . }}{{ end }})
 					SELECT
-					  id,
+					    id_hash,
+						id,
+						_jsonb,
 					  {{ .Casts }}
 					FROM (
 					  SELECT
+						id_hash,
 						id,
-						JSON_VALUE(_jsonb, "$.{{ .Path }}") AS val,
-						JSON_VALUE(_jsonb, "{{ .TypePath }}") AS val_type,
-						JSON_EXISTS(_jsonb, '$.{{ .Path }} ? (@ == $min)' PASSING -9223372036854775808 AS "min") AS is_min,
-  						JSON_EXISTS(_jsonb, '$.{{ .Path }} ? (@ == $max)' PASSING 9223372036854775807 AS "max") AS is_max
+						_jsonb
 					  FROM {{ escapeName .TableName }}
-					  WHERE JSON_EXISTS(_jsonb, "$.{{ .Path }}")
-					  ORDER BY id
-					  LIMIT {{ .Limit }} OFFSET {{ .Offset }}
+					  WHERE id_hash > $lastId
+
+					  ORDER BY id_hash
+					  LIMIT $limit
 					);
+
+					SELECT
+						id_hash
+					  FROM {{ escapeName .TableName }}
+					  WHERE id_hash > $lastId
+
+					  ORDER BY id_hash
+					  LIMIT $limit;
 				`)),
-				map[string]any{
-					"TablePathPrefix": prefix,
-					"TableName":       tableName,
-					"Columns":         columns,
-					"Path":            jsonPath,
-					"TypePath":        typePath,
-					"Casts":           strings.Join(casts, ",\n  "),
-					"Limit":           batchSize,
-					"Offset":          offset,
-				},
-			)
+			map[string]any{
+				"TablePathPrefix": prefix,
+				"TableName":       tableName,
+				"Columns":         columns,
+				"Casts":           strings.Join(casts, ",\n"),
+			},
+		)
 
-			var rowCount uint64
-			err := c.DoTx(ctx, func(ctx context.Context, tx table.TransactionActor) error {
-				res, err := tx.Execute(ctx, q, table.NewQueryParameters())
-				if err != nil {
-					return err
-				}
-				defer res.Close()
-
-				if res.NextResultSet(ctx) && res.NextRow() {
-					if err = res.ScanNamed(named.OptionalWithDefault("cnt", &rowCount)); err != nil {
-						return err
-					}
-				}
-
-				return res.Err()
-			})
+		err := c.DoTx(ctx, func(ctx context.Context, tx table.TransactionActor) error {
+			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
+				table.ValueParam("$limit", ydbTypes.Uint64Value(uint64(limit))),
+				table.ValueParam("$lastId", ydbTypes.BytesValueFromString(lastId)),
+			))
 			if err != nil {
 				return err
 			}
+			defer func() {
+				_ = res.Close()
+			}()
 
-			if rowCount == 0 {
-				break
+			if !res.NextResultSet(ctx) || !res.HasNextRow() {
+				empty = true
+
+				return res.Err()
 			}
 
-			offset += batchSize
+			for res.NextRow() {
+				err = res.ScanNamed(
+					named.Required("id_hash", &lastId),
+				)
+				if err != nil {
+					return err
+				}
+			}
+
+			return res.Err()
+		})
+
+		if err != nil {
+			return err
 		}
+
 	}
 
 	return nil
@@ -252,6 +266,45 @@ func dropIndex(ctx context.Context, c table.Client, prefix string, tableName str
 	}
 
 	return nil
+}
+
+func ExtractIndexFields(doc *types.Document, indexes Indexes) map[string]IndexColumn {
+	extraColumns := map[string]IndexColumn{}
+	for _, index := range indexes {
+		for _, pair := range index.Key {
+			path, err := types.NewPathFromString(pair.Field)
+			if err != nil {
+				continue
+			}
+
+			has := doc.HasByPath(path)
+			if !has {
+				continue
+			}
+
+			val, err := doc.GetByPath(path)
+			if err != nil {
+				continue
+			}
+
+			bsonType := sjson.GetTypeOfValue(val)
+			ydbType := MapBSONTypeToYDBType(bsonType)
+
+			if ydbType == nil {
+				continue
+			}
+
+			columnName := fmt.Sprintf("%s_%s", CleanColumnName(pair.Field), bsonType)
+			extraColumns[columnName] = IndexColumn{
+				ColumnName:  columnName,
+				BsonType:    bsonType,
+				ColumnType:  ydbType.String(),
+				ColumnValue: val,
+			}
+		}
+	}
+
+	return extraColumns
 }
 
 func DotNotationToJSONPath(dotPath string) string {

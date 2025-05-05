@@ -353,9 +353,23 @@ tasks:
         --handler=sqlite
         --sqlite-url=file:tmp/sqlite/
         --test-records-dir=tmp/records
-  
+
   run-ydb:
     desc: "Run FerretDB with `ydb` backend"
+    deps: [ build-host ]
+    cmds:
+      - >
+        bin/ferretdb{{exeExt}}
+        --listen-addr=:27017
+        --proxy-addr=127.0.0.1:47017
+        --mode=diff-normal
+        --repl-set-name=rs0
+        --handler=ydb
+        --ydb-url='grpc://localhost:2136?database=/local'
+        --test-records-dir=tmp/records
+
+  run-ydb-secured:
+    desc: "Run FerretDB with `ydb` backend secured"
     deps: [build-host]
     cmds:
       - >
@@ -365,7 +379,9 @@ tasks:
         --mode=diff-normal
         --repl-set-name=rs0
         --handler=ydb
-        --ydb-url='grpc://127.0.0.1:2136/local'
+        --ydb-url='grpcs://username:password@localhost:2135?database=/local'
+        --ydb-auth='static'
+        --ydb-file-path='./build/certs/ydb_certs/ca.pem'
         --test-records-dir=tmp/records
 
   run-mysql:

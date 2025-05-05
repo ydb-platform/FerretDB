@@ -24,6 +24,8 @@ type backend struct {
 //nolint:vet // for readability
 type NewBackendParams struct {
 	URI       string
+	Auth      string
+	AuthFile  string
 	L         *slog.Logger
 	P         *state.Provider
 	BatchSize int
@@ -32,7 +34,7 @@ type NewBackendParams struct {
 
 // NewBackend creates a new Backend.
 func NewBackend(params *NewBackendParams) (backends.Backend, error) {
-	r, err := metadata.NewRegistry(params.URI, params.BatchSize, params.L, params.P)
+	r, err := metadata.NewRegistry(params.URI, params.Auth, params.AuthFile, params.BatchSize, params.L, params.P)
 	if err != nil {
 		return nil, err
 	}

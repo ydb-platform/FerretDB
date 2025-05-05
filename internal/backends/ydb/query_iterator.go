@@ -60,6 +60,8 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 		return unused, nil, iterator.ErrIteratorDone
 	}
 
+	defer iter.rs.Close()
+
 	if err := context.Cause(iter.ctx); err != nil {
 		iter.close()
 		return unused, nil, lazyerrors.Error(err)
@@ -100,7 +102,6 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 		panic(fmt.Sprintf("cannot scan unknown columns: %v", columns))
 	}
 
-	defer iter.rs.Close()
 	if err := iter.rs.ScanWithDefaults(dest...); err != nil {
 		iter.close()
 		return unused, nil, lazyerrors.Error(err)

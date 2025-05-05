@@ -169,7 +169,9 @@ var hanaFlags struct {
 //
 //nolint:lll // some tags are long
 var ydbFlags struct {
-	YdbURL string `name:"ydb-url" default:"grpc://127.0.0.1:2136?database=/local" help:"YDB URL for 'ydb' handler."`
+	YdbURL      string `name:"ydb-url" default:"grpc://127.0.0.1:2136?database=/local" help:"YDB URL for 'ydb' handler."`
+	YdbAuth     string `name:"ydb-auth" help:"YDB auth handler."`
+	YdbFilePath string `name:"ydb-file-path" help:"YDB CA path."`
 }
 
 // handlerFlags is a map of handler names to their flags.
@@ -534,7 +536,9 @@ func run() {
 
 		MySQLURL: mySQLFlags.MySQLURL,
 
-		YdbURL: ydbFlags.YdbURL,
+		YdbURL:  ydbFlags.YdbURL,
+		YdbAuth: ydbFlags.YdbAuth,
+		YdbFile: ydbFlags.YdbFilePath,
 
 		TestOpts: registry.TestOpts{
 			DisablePushdown:         cli.Test.DisablePushdown,

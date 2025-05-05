@@ -21,6 +21,8 @@ import (
 	"strings"
 )
 
+const defaultRowsLimit = 1000
+
 // collection implements backends.Collection interface.
 type collection struct {
 	r      *metadata.Registry
@@ -63,7 +65,11 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 		}, nil
 	}
 
-	q := PrepareSelectClause(&metadata.SelectParams{
+	var builder strings.Builder
+
+	builder.WriteString(fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n", ydbPath))
+
+	selectClause := prepareSelectClause(&metadata.SelectParams{
 		Schema:        c.dbName,
 		Table:         meta.TableName,
 		Comment:       params.Comment,
@@ -71,45 +77,45 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 		OnlyRecordIDs: params.OnlyRecordIDs,
 	})
 
-	where, args, useIndex, typePatch, err := prepareWhereClause(params.Filter, meta)
+	where, args, useIndex, err := prepareWhereClause(params.Filter, meta)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	if useIndex.use {
-		q = fmt.Sprintf("%s VIEW %s", q, useIndex.idxName)
-	}
-
-	if useIndex.use && typePatch.fieldPath != "" {
-		newWhere, err := transformCondition(where, typePatch.fieldPath, typePatch.scalarType)
-		if err != nil {
-			return nil, lazyerrors.Error(err)
-		}
-		where = newWhere
-	}
-
 	var declareParts []string
 	if len(*args) > 0 {
-		q += " WHERE " + where
-		for _, param := range *args {
+		declareParts = make([]string, len(*args))
+		for i, param := range *args {
 			paramName := param.Name()
 			paramValue := param.Value()
-			declareParts = append(declareParts, fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String()))
+			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String())
 		}
 	}
 
 	if len(declareParts) > 0 {
-		q = fmt.Sprintf("\n%s\n%s", strings.Join(declareParts, "\n"), q)
+		builder.WriteString(strings.Join(declareParts, "\n"))
 	}
 
-	q = fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n%s", ydbPath, q)
+	builder.WriteString(selectClause)
+
+	if useIndex.idxName != nil {
+		builder.WriteString(fmt.Sprintf(" VIEW %s", *useIndex.idxName))
+	}
+
+	if len(*args) > 0 {
+		builder.WriteString(" WHERE " + where)
+	}
 
 	sort := prepareOrderByClause(params.Sort)
-	q += sort
+	builder.WriteString(sort)
 
 	if params.Limit != 0 {
-		q += fmt.Sprintf(` LIMIT %d`, params.Limit)
+		builder.WriteString(fmt.Sprintf(" LIMIT %d", params.Limit))
+	} else {
+		builder.WriteString(fmt.Sprintf(" LIMIT %d", defaultRowsLimit))
 	}
+
+	q := builder.String()
 
 	var res result.Result
 	err = c.r.D.Driver.Table().Do(ctx,
@@ -175,8 +181,51 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 
 	ydbPath := c.r.DbMapping[c.dbName]
 
-	q := PrepareSelectClause(opts)
-	q = fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n%s", ydbPath, q)
+	var builder strings.Builder
+
+	builder.WriteString(fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n", ydbPath))
+
+	selectClause := prepareSelectClause(opts)
+
+	where, args, useIndex, err := prepareWhereClause(params.Filter, meta)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	var declareParts []string
+	if len(*args) > 0 {
+		declareParts = make([]string, len(*args))
+		for i, param := range *args {
+			paramName := param.Name()
+			paramValue := param.Value()
+			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String())
+		}
+	}
+
+	if len(declareParts) > 0 {
+		builder.WriteString(strings.Join(declareParts, "\n"))
+	}
+
+	builder.WriteString(selectClause)
+
+	if useIndex.idxName != nil {
+		builder.WriteString(fmt.Sprintf(" VIEW %s", *useIndex.idxName))
+	}
+
+	if len(*args) > 0 {
+		builder.WriteString(" WHERE " + where)
+	}
+
+	sort := prepareOrderByClause(params.Sort)
+	builder.WriteString(sort)
+
+	if params.Limit != 0 {
+		builder.WriteString(fmt.Sprintf(" LIMIT %d", params.Limit))
+	} else {
+		builder.WriteString(fmt.Sprintf(" LIMIT %d", defaultRowsLimit))
+	}
+
+	q := builder.String()
 
 	err = c.r.D.Driver.Table().Do(
 		ctx,
@@ -231,7 +280,7 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 		batch, rest := docs[:i], docs[i:]
 
 		for _, doc := range batch {
-			extraColumns = extractIndexFields(doc, meta.Indexes)
+			extraColumns = metadata.ExtractIndexFields(doc, meta.Indexes)
 			documentsData = append(documentsData, SingleDocumentData(doc, extraColumns, meta.Capped()))
 		}
 
@@ -307,6 +356,7 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 			if err != nil {
 				return err
 			}
+
 			defer func() {
 				_ = res.Close()
 			}()
@@ -366,7 +416,7 @@ func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllPa
 
 	extraColumns := make(map[string]metadata.IndexColumn)
 	for _, doc := range docs {
-		extraColumns = extractIndexFields(doc, colMeta.Indexes)
+		extraColumns = metadata.ExtractIndexFields(doc, colMeta.Indexes)
 		documentsData = append(documentsData, SingleDocumentData(doc, extraColumns, colMeta.Capped()))
 	}
 
@@ -570,23 +620,6 @@ func (c *collection) DropIndexes(ctx context.Context, params *backends.DropIndex
 // Compact implements backends.Collection interface.
 func (c *collection) Compact(ctx context.Context, params *backends.CompactParams) (*backends.CompactResult, error) {
 	return new(backends.CompactResult), nil
-}
-
-func prepareIDs(params *backends.DeleteAllParams) []ydbTypes.Value {
-	var ids []ydbTypes.Value
-	if params.RecordIDs == nil {
-		ids = make([]ydbTypes.Value, 0, len(params.IDs))
-		for _, id := range params.IDs {
-			ids = append(ids, ydbTypes.BytesValueFromString(getIdFromAny(id)))
-		}
-	} else {
-		ids = make([]ydbTypes.Value, 0, len(params.RecordIDs))
-		for _, id := range params.RecordIDs {
-			ids = append(ids, ydbTypes.Int64Value(id))
-		}
-	}
-
-	return ids
 }
 
 // check interfaces

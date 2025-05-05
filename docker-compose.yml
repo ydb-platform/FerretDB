@@ -74,7 +74,7 @@ services:
       context: ./build/deps
       dockerfile: ydb.Dockerfile
     container_name: ferretdb_ydb
-    hostname: 127.0.0.1
+    hostname: localhost
     ports:
       - "8765:8765" # HTTP monitoring port
       - "2136:2136" # grpc

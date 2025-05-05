@@ -50,7 +50,7 @@ const (
 					DECLARE $IDs AS List<{{ .IDType }}>;
 					
 					$to_delete = (
-						SELECT {{ .ColumnName }}
+						SELECT {{ .ColumnName }}, id_hash
 						FROM {{ .TableName | escapeName}}
 						WHERE {{ .ColumnName }} IN $IDs
 					);
@@ -74,44 +74,52 @@ const (
 	`
 
 	UpdateMetadataTemplate = `
-				PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
-
-				DECLARE $meta_id AS Uuid;
-				DECLARE $json AS Json;
-
-				REPLACE INTO {{ .TableName | escapeName}} (id, _jsonb) 
-				VALUES ($meta_id, $json);
+					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
+	
+					DECLARE $meta_id AS Uuid;
+					DECLARE $json AS Json;
+	
+					REPLACE INTO {{ .TableName | escapeName}} (id, _jsonb) 
+					VALUES ($meta_id, $json);
 	`
 
 	SelectMetadataTemplate = `
-				PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
-				SELECT {{ .ColumnName }} FROM {{ .TableName | escapeName}}
+					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
+
+					DECLARE $limit AS Uint64;
+					DECLARE $lastKey AS Uuid;
+					
+					SELECT id, {{ .ColumnName }} FROM {{ .TableName | escapeName}}
+					WHERE id > $lastKey
+		
+					ORDER BY id
+					LIMIT $limit
 	`
 
 	UpsertTemplate = `
-				PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
-				
-				DECLARE $insertData AS List<Struct<
-				{{ .FieldDecls }}
-				>>;
-				
-				UPSERT INTO {{ escapeName .TableName }}
-				SELECT
-				{{ .SelectFields }}
-				FROM AS_TABLE($insertData);
+					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
+					
+					DECLARE $insertData AS List<Struct<
+					{{ .FieldDecls }}
+					>>;
+					
+					UPSERT INTO {{ escapeName .TableName }}
+					SELECT
+					{{ .SelectFields }}
+					FROM AS_TABLE($insertData);
 	`
 
 	InsertTemplate = `
-				PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
-				
-				DECLARE $insertData AS List<Struct<
-				{{ .FieldDecls }}
-				>>;
-				
-				INSERT INTO {{ .TableName | escapeName}}
-				SELECT
-				{{ .SelectFields }}
-				FROM AS_TABLE($insertData);
+					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
+					
+					DECLARE $insertData AS List<Struct<
+					{{ .FieldDecls }}
+					>>;
+					
+					INSERT INTO {{ .TableName | escapeName}}
+					SELECT
+					{{ .SelectFields }}
+					FROM AS_TABLE($insertData);
 	`
 )
 

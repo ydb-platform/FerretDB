@@ -1,8 +1,10 @@
 package metadata
 
 import (
+	"context"
 	"log/slog"
 	"net/url"
+	"time"
 
 	"github.com/ydb-platform/ydb-go-sdk/v3"
 
@@ -19,7 +21,7 @@ type DB struct {
 	token   *resource.Token
 }
 
-func New(dsn string, l *slog.Logger, sp *state.Provider) (*DB, error) {
+func New(dsn, auth, ca string, l *slog.Logger, sp *state.Provider) (*DB, error) {
 	baseURI, err := url.Parse(dsn)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
@@ -27,7 +29,7 @@ func New(dsn string, l *slog.Logger, sp *state.Provider) (*DB, error) {
 
 	values := baseURI.Query()
 	baseURI.RawQuery = values.Encode()
-	driver, err := openDB(baseURI, l, sp)
+	driver, err := openDB(baseURI, auth, ca, l, sp)
 	if err != nil {
 		return nil, err
 	}
@@ -43,4 +45,13 @@ func New(dsn string, l *slog.Logger, sp *state.Provider) (*DB, error) {
 	resource.Track(p, p.token)
 
 	return p, nil
+}
+
+func (db *DB) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db.Driver.Close(ctx)
+
+	resource.Untrack(db, db.token)
 }

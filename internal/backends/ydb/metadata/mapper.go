@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func SupportedIndexTypes() map[string]ydbTypes.Type {
+func GetSupportedIndexTypes() map[string]ydbTypes.Type {
 	return map[string]ydbTypes.Type{
 		"string":   ydbTypes.TypeString,
 		"objectId": ydbTypes.TypeString,
@@ -17,15 +17,6 @@ func SupportedIndexTypes() map[string]ydbTypes.Type {
 		"long":     ydbTypes.TypeInt64,
 		"int":      ydbTypes.TypeInt32,
 		"double":   ydbTypes.TypeInt64, // when double can be represented as int64
-	}
-}
-
-func SupportedIndexValues(val any) map[string]ydbTypes.Value {
-	return map[string]ydbTypes.Value{
-		"string": ydbTypes.BytesValueFromString(val.(string)),
-		"bool":   ydbTypes.BoolValue(val.(bool)),
-		"long":   ydbTypes.Int64Value(val.(int64)),
-		"int":    ydbTypes.Int32Value(val.(int32)),
 	}
 }
 

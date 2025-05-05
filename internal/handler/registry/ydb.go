@@ -12,6 +12,8 @@ func init() {
 	registry["ydb"] = func(opts *NewHandlerOpts) (*handler.Handler, CloseBackendFunc, error) {
 		b, err := ydb.NewBackend(&ydb.NewBackendParams{
 			URI:       opts.YdbURL,
+			Auth:      opts.YdbAuth,
+			AuthFile:  opts.YdbFile,
 			L:         logging.WithName(opts.Logger, "ydb"),
 			P:         opts.StateProvider,
 			BatchSize: opts.BatchSize,

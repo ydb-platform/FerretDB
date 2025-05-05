@@ -4,39 +4,59 @@ import (
 	"context"
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/rs/zerolog"
+	"github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/trace"
+	yc "github.com/ydb-platform/ydb-go-yc"
 	"log/slog"
 	"net/url"
 	"os"
-	"time"
-
-	"github.com/ydb-platform/ydb-go-sdk/v3"
 
 	"github.com/FerretDB/FerretDB/internal/util/state"
 	ydbZerolog "github.com/ydb-platform/ydb-go-sdk-zerolog"
 )
 
-func openDB(dsn *url.URL, _ *slog.Logger, _ *state.Provider) (*ydb.Driver, error) {
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func openDB(dsn *url.URL, auth, file string, _ *slog.Logger, _ *state.Provider) (*ydb.Driver, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	log := zerolog.New(os.Stdout).With().Timestamp().Logger()
+	var opts []ydb.Option
 
-	opts := []ydb.Option{
+	log := zerolog.New(os.Stdout).With().Timestamp().Logger()
+	opts = []ydb.Option{
 		ydbZerolog.WithTraces(
 			&log,
 			trace.DetailsAll,
 		),
 	}
 
-	if dsn.Scheme == "grpcs" {
-		if dsn.User != nil {
-			username := dsn.User.Username()
-			password, _ := dsn.User.Password()
+	useTLS := dsn.Scheme == "grpcs"
+
+	if useTLS {
+		switch auth {
+		case "static":
+			var username, password string
+
+			if dsn.User != nil {
+				username = dsn.User.Username()
+				password, _ = dsn.User.Password()
+			}
 
 			if username != "" && password != "" {
 				opts = append(opts, ydb.WithStaticCredentials(username, password))
+			}
+
+			if file != "" {
+				caData, err := os.ReadFile(file)
+				if err != nil {
+					return nil, lazyerrors.Error(err)
+				}
+				opts = append(opts, ydb.WithCertificatesFromPem(caData))
+			}
+		case "sa_file":
+			if file != "" {
+				opts = append(opts,
+					yc.WithInternalCA(),
+					yc.WithServiceAccountKeyFileCredentials(file))
 			}
 		}
 	}
@@ -46,7 +66,7 @@ func openDB(dsn *url.URL, _ *slog.Logger, _ *state.Provider) (*ydb.Driver, error
 		return nil, lazyerrors.Error(err)
 	}
 
-	if dsn.Scheme == "grpcs" {
+	if useTLS {
 		whoAmI, err := driver.Discovery().WhoAmI(ctx)
 		if err != nil {
 			return nil, lazyerrors.Error(err)

@@ -2,9 +2,14 @@ package metadata
 
 import (
 	"github.com/FerretDB/FerretDB/internal/backends"
+	"regexp"
 )
 
 const (
+	// YDB table name where FerretDB metadata is stored.
+	metadataTableName = backends.ReservedPrefix + "database_metadata"
+
+	maxObjectNameLength = 255
 	// DefaultColumn is a column name for all fields.
 	DefaultColumn   = "_jsonb"
 	DefaultIDColumn = "id"
@@ -12,6 +17,9 @@ const (
 	// RecordIDColumn is a name for RecordID column to store capped collection record id.
 	RecordIDColumn = backends.ReservedPrefix + "record_id"
 )
+
+// specialCharacters are unsupported characters of YDB scheme object name that are replaced with `_`.
+var specialCharacters = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 // Collection represents collection metadata.
 //

@@ -64,7 +64,9 @@ type NewHandlerOpts struct {
 	MySQLURL string
 
 	// for `ydb` handler
-	YdbURL string
+	YdbURL  string
+	YdbAuth string
+	YdbFile string
 
 	TestOpts
 

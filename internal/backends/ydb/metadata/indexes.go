@@ -3,20 +3,22 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/handler/sjson"
 	"github.com/FerretDB/FerretDB/internal/types"
+	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
+	"github.com/ydb-platform/ydb-go-sdk/v3"
+	"github.com/ydb-platform/ydb-go-sdk/v3/query"
+	"github.com/ydb-platform/ydb-go-sdk/v3/sugar"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
-	"math/rand/v2"
 	"path"
 	"regexp"
 	"slices"
 	"strings"
 	"text/template"
-
-	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 )
 
 // Indexes represents information about all indexes in a collection.
@@ -24,10 +26,11 @@ type Indexes []IndexInfo
 
 // IndexInfo represents information about a single index.
 type IndexInfo struct {
-	Name   string
-	Ready  bool
-	Key    []IndexKeyPair
-	Unique bool
+	Name          string
+	SanitizedName string
+	Ready         bool
+	Key           []IndexKeyPair
+	Unique        bool
 }
 
 // IndexKeyPair consists of a field name and a sort order that are part of the index.
@@ -38,9 +41,15 @@ type IndexKeyPair struct {
 
 type IndexColumn struct {
 	ColumnName  string
-	BsonType    string
+	BsonType    BsonType
 	ColumnType  string
 	ColumnValue any
+}
+
+type SecondaryIndexDef struct {
+	Name    string
+	Unique  bool
+	Columns []string
 }
 
 // deepCopy returns a deep copy.
@@ -49,10 +58,11 @@ func (indexes Indexes) deepCopy() Indexes {
 
 	for i, index := range indexes {
 		res[i] = IndexInfo{
-			Name:   index.Name,
-			Ready:  index.Ready,
-			Key:    slices.Clone(index.Key),
-			Unique: index.Unique,
+			Name:          index.Name,
+			SanitizedName: index.SanitizedName,
+			Ready:         index.Ready,
+			Key:           slices.Clone(index.Key),
+			Unique:        index.Unique,
 		}
 	}
 
@@ -87,10 +97,6 @@ func dropFieldColumns(ctx context.Context, c table.Client, prefix string, tableN
 	return nil
 }
 
-func GetColumnsInDefinedOrder() []string {
-	return []string{"string", "objectId", "bool", "date", "long", "int", "double"}
-}
-
 func buildTypePath(path string) string {
 	parts := strings.Split(path, ".")
 
@@ -107,33 +113,42 @@ func buildTypePath(path string) string {
 	return sb.String()
 }
 
-func migrateIndexData(ctx context.Context, c table.Client, prefix, tableName string, fieldNames []IndexKeyPair) error {
-	supportedTypes := GetSupportedIndexTypes()
+func migrateIndexData(ctx context.Context, d *ydb.Driver, prefix, tableName string, fieldNames []IndexKeyPair) error {
 	var columns []string
 	var casts []string
 	for _, pair := range fieldNames {
 		fieldName := pair.Field
 		typePath := buildTypePath(fieldName)
-		jsonPath := DotNotationToJSONPath(fieldName)
-		fieldName = strings.ReplaceAll(fieldName, ".", "")
+		jsonPath := DotNotationToJsonPath(fieldName)
+		fieldName = columnNameCharacters.ReplaceAllString(fieldName, "_")
 
-		for bson, yType := range supportedTypes {
-			colName := fmt.Sprintf("%s_%s", fieldName, bson)
+		for _, colType := range ColumnOrder {
+			colName := fmt.Sprintf("%s_%s", fieldName, colType)
 			columns = append(columns, colName)
 
-			if bson == "double" {
+			if colType == "double" {
 				casts = append(casts, fmt.Sprintf(`
 					CASE 
 						WHEN JSON_VALUE(_jsonb, "%s") = "%s" 
-						THEN
-							CASE 
-								WHEN JSON_EXISTS(_jsonb, '$.%s ? (@ == $min)' PASSING -9223372036854775808 AS "min") THEN -9223372036854775808
-								WHEN JSON_EXISTS(_jsonb, '$.%s ? (@ == $max)' PASSING 9223372036854775807 AS "max") THEN 9223372036854775807
-								ELSE CAST(JSON_VALUE(_jsonb, "$.%s") AS %s)
-							END
+						THEN 
+							(	
+							FromBytes(ToBytes(CAST(JSON_VALUE(_jsonb, "$.%s") AS Double)), uint64) 
+       				 		^
+							(
+								FromBytes(ToBytes(
+									CASE 
+										WHEN FromBytes(ToBytes(CAST(JSON_VALUE(_jsonb, "$.%s") AS Double)), int64) < 0 
+										THEN CAST(-1 AS int64) 
+										ELSE CAST(0 AS int64) 
+									END
+								), uint64) 
+								| 0x8000000000000000ul
+							)
+							)
+							
 						ELSE NULL
 					END AS %s
-			`, typePath, bson, jsonPath, jsonPath, jsonPath, yType.String(), colName))
+			`, typePath, colType, jsonPath, jsonPath, colName))
 			} else {
 				casts = append(casts, fmt.Sprintf(`
 					CASE 
@@ -141,13 +156,13 @@ func migrateIndexData(ctx context.Context, c table.Client, prefix, tableName str
 						THEN CAST(JSON_VALUE(_jsonb, "$.%s") AS %s) 
 						ELSE NULL 
 					END AS %s
-			`, typePath, bson, jsonPath, yType.String(), colName))
+			`, typePath, colType, jsonPath, ColumnStoreToYdbType(colType).String(), colName))
 			}
 		}
 	}
 
 	limit := 100
-	lastId := ""
+	var lastId uint64
 	empty := false
 
 	for !empty {
@@ -160,18 +175,16 @@ func migrateIndexData(ctx context.Context, c table.Client, prefix, tableName str
 					PRAGMA TablePathPrefix("{{ .TablePathPrefix }}");
 
 					DECLARE $limit AS Uint64;
-					DECLARE $lastId AS String;
+					DECLARE $lastId AS Uint64;
 
-					UPSERT INTO {{ escapeName .TableName }} (id_hash, id, _jsonb{{ range .Columns }}, {{ . }}{{ end }})
+					UPSERT INTO {{ escapeName .TableName }} (id_hash, _jsonb{{ range .Columns }}, {{ . }}{{ end }})
 					SELECT
 					    id_hash,
-						id,
 						_jsonb,
 					  {{ .Casts }}
 					FROM (
 					  SELECT
 						id_hash,
-						id,
 						_jsonb
 					  FROM {{ escapeName .TableName }}
 					  WHERE id_hash > $lastId
@@ -196,31 +209,38 @@ func migrateIndexData(ctx context.Context, c table.Client, prefix, tableName str
 			},
 		)
 
-		err := c.DoTx(ctx, func(ctx context.Context, tx table.TransactionActor) error {
-			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
-				table.ValueParam("$limit", ydbTypes.Uint64Value(uint64(limit))),
-				table.ValueParam("$lastId", ydbTypes.BytesValueFromString(lastId)),
-			))
+		err := d.Query().Do(ctx, func(ctx context.Context, s query.Session) error {
+			r, err := s.Query(ctx, q,
+				query.WithTxControl(query.SerializableReadWriteTxControl(query.CommitTx())),
+				query.WithParameters(
+					table.NewQueryParameters(
+						table.ValueParam("$limit", ydbTypes.Uint64Value(uint64(limit))),
+						table.ValueParam("$lastId", ydbTypes.Uint64Value(lastId)),
+					),
+				))
 			if err != nil {
 				return err
 			}
 			defer func() {
-				_ = res.Close()
+				_ = r.Close(ctx)
 			}()
 
-			if !res.NextResultSet(ctx) || !res.HasNextRow() {
-				empty = true
+			res := sugar.Result(r)
 
-				return res.Err()
+			found := false
+			for res.NextResultSet(ctx) {
+				for res.NextRow() {
+					found = true
+					err = res.ScanNamed(named.Required(IdHashColumn, &lastId))
+					if err != nil {
+						return err
+					}
+
+				}
 			}
 
-			for res.NextRow() {
-				err = res.ScanNamed(
-					named.Required("id_hash", &lastId),
-				)
-				if err != nil {
-					return err
-				}
+			if !found {
+				empty = true
 			}
 
 			return res.Err()
@@ -229,7 +249,6 @@ func migrateIndexData(ctx context.Context, c table.Client, prefix, tableName str
 		if err != nil {
 			return err
 		}
-
 	}
 
 	return nil
@@ -271,6 +290,9 @@ func dropIndex(ctx context.Context, c table.Client, prefix string, tableName str
 func ExtractIndexFields(doc *types.Document, indexes Indexes) map[string]IndexColumn {
 	extraColumns := map[string]IndexColumn{}
 	for _, index := range indexes {
+		if index.Name == backends.DefaultIndexName {
+			continue
+		}
 		for _, pair := range index.Key {
 			path, err := types.NewPathFromString(pair.Field)
 			if err != nil {
@@ -287,14 +309,15 @@ func ExtractIndexFields(doc *types.Document, indexes Indexes) map[string]IndexCo
 				continue
 			}
 
-			bsonType := sjson.GetTypeOfValue(val)
-			ydbType := MapBSONTypeToYDBType(bsonType)
+			bsonType := BsonType(sjson.GetTypeOfValue(val))
+			ydbType := BsonTypeToYdbType(bsonType)
 
 			if ydbType == nil {
 				continue
 			}
 
-			columnName := fmt.Sprintf("%s_%s", CleanColumnName(pair.Field), bsonType)
+			fieldName := columnNameCharacters.ReplaceAllString(pair.Field, "_")
+			columnName := fmt.Sprintf("%s_%s", fieldName, bsonType)
 			extraColumns[columnName] = IndexColumn{
 				ColumnName:  columnName,
 				BsonType:    bsonType,
@@ -307,7 +330,7 @@ func ExtractIndexFields(doc *types.Document, indexes Indexes) map[string]IndexCo
 	return extraColumns
 }
 
-func DotNotationToJSONPath(dotPath string) string {
+func DotNotationToJsonPath(dotPath string) string {
 	parts := strings.Split(dotPath, ".")
 	re := regexp.MustCompile(`^\d+$`)
 
@@ -325,19 +348,4 @@ func DotNotationToJSONPath(dotPath string) string {
 	}
 
 	return sb.String()
-}
-
-func CleanRootKey(rootKey string) string {
-	re := regexp.MustCompile(`[.\[\]-]`)
-	cleanedKey := re.ReplaceAllString(rootKey, "")
-	randomNumber := rand.IntN(1000000)
-
-	return fmt.Sprintf("f_%s_%d", cleanedKey, randomNumber)
-}
-
-func CleanColumnName(rootKey string) string {
-	re := regexp.MustCompile(`[.\[\]]`)
-	cleanedKey := re.ReplaceAllString(rootKey, "")
-
-	return cleanedKey
 }

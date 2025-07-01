@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata/transaction"
-	"github.com/FerretDB/FerretDB/internal/util/must"
 	"github.com/ydb-platform/ydb-go-sdk/v3/sugar"
 	"golang.org/x/exp/maps"
-	"hash/fnv"
 	"log/slog"
 	"path"
 	"slices"
@@ -18,17 +17,10 @@ import (
 
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/state"
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
-)
-
-// Parts of Prometheus metric names.
-const (
-	namespace = "ferretdb"
-	subsystem = "ydb_metadata"
 )
 
 // Registry provides access to YDB database and collections information.
@@ -40,7 +32,7 @@ type Registry struct {
 	D         *DB
 	l         *slog.Logger
 	BatchSize int
-	rw        sync.RWMutex
+	Rw        sync.RWMutex
 	colls     map[string]map[string]*Collection // database name -> collection name -> collection
 	DbMapping map[string]string
 }
@@ -67,42 +59,34 @@ func (r *Registry) Close() {
 	r.D.Close()
 }
 
-// LoadMetadata loads collections metadata from the database during initialization
-// if it hasn't been loaded from the database yet.
-//
-// It acquires read lock to check metadata, if metadata is empty it acquires write lock
-// to load metadata, so it is safe for concurrent use.
+// TODO: add centralized cache, e.g. https://github.com/valkey-io/valkey
+// LoadMetadataTable loads collections metadata from the database
 // It uses paginated metadata loading in batches of 1000 records
-func (r *Registry) LoadMetadata(ctx context.Context, dbName string) error {
-	ydbPath := path.Join(r.D.Driver.Name(), dbName)
+func (r *Registry) LoadMetadataTable(ctx context.Context, dbName string) error {
+	if shouldSkipDatabase(dbName) {
+		return nil
+	}
 
-	r.rw.RLock()
+	r.Rw.RLock()
 	if r.colls != nil && r.colls[dbName] != nil {
-		r.rw.RUnlock()
+		r.Rw.RUnlock()
 		return nil
 	}
-	r.rw.RUnlock()
+	r.Rw.RUnlock()
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
+	ydbPath := path.Join(r.D.Driver.Name(), dbName)
 	r.DbMapping[dbName] = ydbPath
-
-	existsTable, err := sugar.IsTableExists(ctx, r.D.Driver.Scheme(), path.Join(ydbPath, metadataTableName))
-	if err != nil {
-		return lazyerrors.Error(err)
-	}
-
-	if !existsTable {
-		return nil
-	}
 
 	r.colls = make(map[string]map[string]*Collection)
 
 	var (
-		lastKey = uuid.Nil
-		limit   = 1000
+		lastKey = ""
+		limit   = defaultBatchSize
 		empty   = false
+		err     error
 	)
 
 	for !empty {
@@ -115,14 +99,41 @@ func (r *Registry) LoadMetadata(ctx context.Context, dbName string) error {
 	return nil
 }
 
+// TODO: add centralized cache, e.g. https://github.com/valkey-io/valkey
+func (r *Registry) LoadCollectionMetadata(ctx context.Context, dbName, collectionName string) error {
+	r.Rw.RLock()
+	if r.colls != nil {
+		if dbColls, ok := r.colls[dbName]; ok && dbColls != nil {
+			if dbColls[collectionName] != nil {
+				r.Rw.RUnlock()
+				return nil
+			}
+		}
+	}
+	r.Rw.RUnlock()
+
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
+
+	ydbPath := path.Join(r.D.Driver.Name(), dbName)
+	r.DbMapping[dbName] = ydbPath
+
+	err := r.fetchCollectionMetadata(ctx, ydbPath, dbName, collectionName)
+	if err != nil {
+		return lazyerrors.Error(err)
+	}
+
+	return nil
+}
+
 // DatabaseList returns a sorted list of existing databases.
 func (r *Registry) DatabaseList(ctx context.Context, dbName string) ([]string, error) {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadMetadataTable(ctx, dbName); err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	r.rw.RLock()
-	defer r.rw.RUnlock()
+	r.Rw.RLock()
+	defer r.Rw.RUnlock()
 
 	res := maps.Keys(r.colls)
 	sort.Strings(res)
@@ -132,12 +143,12 @@ func (r *Registry) DatabaseList(ctx context.Context, dbName string) ([]string, e
 
 // DatabaseGetExisting retrieves collections for the specified database or nil if it doesn't exist.
 func (r *Registry) DatabaseGetExisting(ctx context.Context, dbName string) (map[string]*Collection, error) {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadMetadataTable(ctx, dbName); err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	r.rw.RLock()
-	defer r.rw.RUnlock()
+	r.Rw.RLock()
+	defer r.Rw.RUnlock()
 
 	db := r.colls[dbName]
 	if db == nil {
@@ -151,12 +162,12 @@ func (r *Registry) DatabaseGetExisting(ctx context.Context, dbName string) (map[
 //
 // The dbName must be a validated database name.
 func (r *Registry) DatabaseGetOrCreate(ctx context.Context, dbName string) error {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadMetadataTable(ctx, dbName); err != nil {
 		return lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	return r.databaseGetOrCreate(ctx, dbName)
 }
@@ -180,9 +191,18 @@ func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error
 	err := r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			return s.CreateTable(ctx, path.Join(ydbPath, metadataTableName),
-				options.WithColumn(DefaultIDColumn, ydbTypes.TypeUUID),
-				options.WithColumn(DefaultColumn, ydbTypes.Optional(ydbTypes.TypeJSON)),
-				options.WithPrimaryKeyColumn(DefaultIDColumn),
+				options.WithColumn(DefaultIdColumn, ydbTypes.TypeString),
+				options.WithColumn(DefaultColumn, ydbTypes.TypeJSON),
+				options.WithPrimaryKeyColumn(DefaultIdColumn),
+				options.WithProfile(
+					options.WithReplicationPolicy(
+						options.WithReplicationPolicyReplicasCount(1),
+						options.WithReplicationPolicyCreatePerAZ(options.FeatureEnabled),
+					),
+					options.WithPartitioningPolicy(
+						options.WithPartitioningPolicyMode(options.PartitioningAutoSplit),
+					),
+				),
 			)
 		})
 
@@ -209,12 +229,12 @@ func (r *Registry) databaseGetOrCreate(ctx context.Context, dbName string) error
 // Returned boolean value indicates whether the database was dropped.
 // If database does not exist, (false, nil) is returned.
 func (r *Registry) DatabaseDrop(ctx context.Context, dbName string) (bool, error) {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadMetadataTable(ctx, dbName); err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	return r.databaseDrop(ctx, dbName)
 }
@@ -246,12 +266,12 @@ func (r *Registry) databaseDrop(ctx context.Context, dbName string) (bool, error
 //
 // If database does not exist, no error is returned.
 func (r *Registry) CollectionList(ctx context.Context, dbName string) ([]*Collection, error) {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadMetadataTable(ctx, dbName); err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	r.rw.RLock()
-	defer r.rw.RUnlock()
+	r.Rw.RLock()
+	defer r.Rw.RUnlock()
 
 	db := r.colls[dbName]
 	if db == nil {
@@ -273,12 +293,12 @@ func (r *Registry) CollectionList(ctx context.Context, dbName string) ([]*Collec
 // Returned boolean value indicates whether the collection was created.
 // If collection already exists, (false, nil) is returned.
 func (r *Registry) CollectionCreate(ctx context.Context, params *CollectionCreateParams) (bool, error) {
-	if err := r.LoadMetadata(ctx, params.DBName); err != nil {
+	if err := r.LoadCollectionMetadata(ctx, params.DBName, params.Name); err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	return r.collectionCreate(ctx, params)
 }
@@ -302,35 +322,88 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 		return false, lazyerrors.Errorf("target backend scheme object not found for %q", params.DBName)
 	}
 
-	if r.collectionExists(dbName, collectionName) {
+	exists = r.collectionExists(dbName, collectionName)
+	if exists {
 		return false, nil
 	}
 
-	tableName := r.generateUniqueTableName(dbName, collectionName)
+	tableName := r.GenerateUniqueTableName(dbName, collectionName)
 
-	err = r.createTable(ctx, ydbPath, tableName, params.Capped())
-	if err != nil {
-		return false, lazyerrors.Error(err)
+	var columnDefs []string
+	var pkColumnNames []string
+	var secondaryIndexDefs []SecondaryIndexDef
+
+	indexSet := make(map[string]struct{})
+	fieldSet := make(map[string]struct{})
+
+	var primaryKeyColumns = BuildPrimaryKeyColumns()
+
+	for i := range primaryKeyColumns {
+		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", primaryKeyColumns[i].Name, primaryKeyColumns[i].Type.String()))
+		pkColumnNames = append(pkColumnNames, primaryKeyColumns[i].Name)
 	}
 
-	supported := GetSupportedIndexTypes()
-	definedOrder := GetColumnsInDefinedOrder()
-	columns := make([]options.AlterTableOption, 0, len(supported))
-	columnNames := make([]string, 0, len(supported))
-	for _, bsonType := range definedOrder {
-		if t, ok := supported[bsonType]; ok {
-			columnName := fmt.Sprintf("%s_%s", "_id", bsonType)
-			columns = append(columns, options.WithAddColumn(columnName, ydbTypes.Optional(t)))
-			columnNames = append(columnNames, columnName)
+	if params.Capped() {
+		primaryKeyColumns = append(primaryKeyColumns, PrimaryKeyColumn{
+			Name: RecordIDColumn,
+			Type: ydbTypes.Optional(ydbTypes.TypeInt64),
+		})
+
+		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", RecordIDColumn, ydbTypes.Optional(ydbTypes.TypeInt64)))
+		pkColumnNames = append(pkColumnNames, RecordIDColumn)
+	}
+
+	indexSet[backends.DefaultIndexName] = struct{}{}
+	fieldSet[IdMongoField] = struct{}{}
+
+	for i, index := range params.Indexes {
+		if _, seen := indexSet[index.Name]; seen {
+			continue
 		}
+
+		indexName := generateIndexName(index.Name)
+		params.Indexes[i].SanitizedName = indexName
+
+		var indexColumns []string
+		for _, pair := range index.Key {
+			fieldName := columnNameCharacters.ReplaceAllString(pair.Field, "_")
+
+			for _, suffix := range ColumnOrder {
+				columnName := fmt.Sprintf("%s_%s", fieldName, suffix)
+				if _, seen := fieldSet[pair.Field]; !seen {
+					columnDefs = append(columnDefs, fmt.Sprintf("%s %s", columnName, ydbTypes.Optional(ColumnStoreToYdbType(suffix))))
+				}
+				indexColumns = append(indexColumns, columnName)
+			}
+			fieldSet[pair.Field] = struct{}{}
+		}
+
+		secondaryIndexDefs = append(secondaryIndexDefs, SecondaryIndexDef{
+			Name:    indexName,
+			Unique:  index.Unique,
+			Columns: indexColumns,
+		})
+
+		params.Indexes[i].Ready = true
+		indexSet[index.Name] = struct{}{}
 	}
 
-	err = addFieldColumns(ctx, r.D.Driver.Table(), ydbPath, tableName, columns)
+	q, err := Render(CreateTableTmpl, CreateTableTemplateConfig{
+		TablePathPrefix:   ydbPath,
+		TableName:         tableName,
+		ColumnDefs:        strings.Join(columnDefs, ", "),
+		PrimaryKeyColumns: pkColumnNames,
+		Indexes:           secondaryIndexDefs,
+	})
+
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	err = addIndex(ctx, r.D.Driver.Table(), ydbPath, tableName, columnNames, fmt.Sprintf("_%s_", DefaultIDColumn))
+	err = r.D.Driver.Table().Do(ctx, func(ctx context.Context, s table.Session) error {
+		return s.ExecuteSchemeQuery(ctx, q)
+	})
+
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
@@ -357,16 +430,13 @@ func (r *Registry) collectionCreate(ctx context.Context, params *CollectionCreat
 	return true, nil
 }
 
-func (r *Registry) generateUniqueTableName(dbName, collectionName string) string {
-	h := fnv.New32a()
-	must.NotFail(h.Write([]byte(collectionName)))
-	s := h.Sum32()
-
+func (r *Registry) GenerateUniqueTableName(dbName, collectionName string) string {
+	s := fnv32Hash(collectionName)
 	var tableName string
 	list := maps.Values(r.colls[dbName])
 
 	for {
-		tableName = specialCharacters.ReplaceAllString(strings.ToLower(collectionName), "_")
+		tableName = objectNameCharacters.ReplaceAllString(strings.ToLower(collectionName), "_")
 
 		suffixHash := fmt.Sprintf("_%08x", s)
 		if l := maxObjectNameLength - len(suffixHash); len(tableName) > l {
@@ -387,16 +457,20 @@ func (r *Registry) generateUniqueTableName(dbName, collectionName string) string
 }
 
 // CollectionGet returns a copy of collection metadata.
-// It can be safely modified by a caller.
-//
-// If database or collection does not exist, nil is returned.
 func (r *Registry) CollectionGet(ctx context.Context, dbName, collectionName string) (*Collection, error) {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadCollectionMetadata(ctx, dbName, collectionName); err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	r.rw.RLock()
-	defer r.rw.RUnlock()
+	r.Rw.RLock()
+	defer r.Rw.RUnlock()
+
+	return r.collectionGet(dbName, collectionName), nil
+}
+
+func (r *Registry) CollectionGetCopy(dbName, collectionName string) (*Collection, error) {
+	r.Rw.RLock()
+	defer r.Rw.RUnlock()
 
 	return r.collectionGet(dbName, collectionName), nil
 }
@@ -421,12 +495,12 @@ func (r *Registry) collectionGet(dbName, collectionName string) *Collection {
 // Returned boolean value indicates whether the collection was dropped.
 // If database or collection did not exist, (false, nil) is returned.
 func (r *Registry) CollectionDrop(ctx context.Context, dbName, collectionName string) (bool, error) {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadCollectionMetadata(ctx, dbName, collectionName); err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	return r.collectionDrop(ctx, dbName, collectionName)
 }
@@ -448,14 +522,8 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 		return false, nil
 	}
 
-	id, err := uuid.Parse(c.UUID)
-	if err != nil {
-		return false, lazyerrors.Error(err)
-	}
-
 	ydbPath := r.DbMapping[dbName]
-
-	err = r.D.Driver.Table().Do(ctx,
+	err := r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) error {
 			return s.DropTable(ctx, path.Join(ydbPath, c.TableName))
 		},
@@ -465,6 +533,7 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 		return false, lazyerrors.Error(err)
 	}
 
+	var p Placeholder
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) error {
 			q, _ := Render(DeleteFromMetadataTmpl, ReplaceIntoMetadataConfig{
@@ -473,7 +542,8 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 			})
 
 			_, res, err := s.Execute(ctx, transaction.WriteTx, q,
-				table.NewQueryParameters(table.ValueParam("$meta_id", ydbTypes.UuidValue(id))))
+				table.NewQueryParameters(table.ValueParam(p.Named("id"), ydbTypes.BytesValueFromString(collectionName))),
+			)
 			if err != nil {
 				return err
 			}
@@ -503,13 +573,13 @@ func (r *Registry) collectionDrop(ctx context.Context, dbName, collectionName st
 // Returned boolean value indicates whether the collection was renamed.
 // If database or collection did not exist, (false, nil) is returned.
 func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionName, newCollectionName string) (bool, error) {
-	err := r.LoadMetadata(ctx, dbName)
+	err := r.LoadCollectionMetadata(ctx, dbName, oldCollectionName)
 	if err != nil {
 		return false, lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	ydbPath := r.DbMapping[dbName]
 	db := r.colls[dbName]
@@ -534,7 +604,7 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 		TableName:       metadataTableName,
 	})
 
-	id := uuid.MustParse(c.UUID)
+	var p Placeholder
 
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
@@ -543,8 +613,8 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 				transaction.WriteTx,
 				q,
 				table.NewQueryParameters(
-					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-					table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
+					table.ValueParam(p.Named("id"), ydbTypes.BytesValueFromString(newCollectionName)),
+					table.ValueParam(p.Named("json"), ydbTypes.JSONValueFromBytes(b)),
 				))
 			return err
 		})
@@ -565,12 +635,12 @@ func (r *Registry) CollectionRename(ctx context.Context, dbName, oldCollectionNa
 //
 // If the user is not authenticated, it returns error.
 func (r *Registry) IndexesCreate(ctx context.Context, dbName, collectionName string, indexes []IndexInfo) error {
-	if err := r.LoadMetadata(ctx, dbName); err != nil {
+	if err := r.LoadCollectionMetadata(ctx, dbName, collectionName); err != nil {
 		return lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	return r.indexesCreate(ctx, dbName, collectionName, indexes)
 }
@@ -580,10 +650,14 @@ func (r *Registry) IndexesCreate(ctx context.Context, dbName, collectionName str
 // Existing indexes with given names are ignored.
 //
 // It does not hold the lock.
-func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName string, indexes []IndexInfo) error {
-	_, err := r.collectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: collectionName})
+func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName string, indexesReq []IndexInfo) error {
+	newlyCreated, err := r.collectionCreate(ctx, &CollectionCreateParams{DBName: dbName, Name: collectionName, Indexes: indexesReq})
 	if err != nil {
 		return lazyerrors.Error(err)
+	}
+
+	if newlyCreated {
+		return nil
 	}
 
 	db := r.colls[dbName]
@@ -591,13 +665,13 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		panic("database does not exist")
 	}
 
-	c := r.collectionGet(dbName, collectionName)
-	if c == nil {
+	targetColl := r.collectionGet(dbName, collectionName)
+	if targetColl == nil {
 		panic("collection does not exist")
 	}
 
 	allIndexes := make(map[string]string, len(db))
-	allFields := make(map[string]string, len(indexes))
+	existingFields := make(map[string]string, len(indexesReq))
 
 	for _, coll := range db {
 		for _, index := range coll.Indexes {
@@ -605,67 +679,65 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		}
 	}
 
-	for _, index := range c.Indexes {
+	for _, index := range targetColl.Indexes {
 		for _, pair := range index.Key {
-			allFields[pair.Field] = index.Name
+			existingFields[pair.Field] = index.Name
 		}
 	}
 
-	created := make([]string, 0, len(indexes))
 	ydbPath := r.DbMapping[dbName]
 
-	for _, index := range indexes {
+	for _, index := range indexesReq {
 		if coll, ok := allIndexes[index.Name]; ok && coll == collectionName {
 			continue
 		}
 
-		supported := GetSupportedIndexTypes()
-		definedOrder := GetColumnsInDefinedOrder()
-		columnNames := make([]string, 0, len(supported))
-		//index.Name = specialCharacters.ReplaceAllString(strings.ToLower(index.Name), "_")
+		if index.Unique {
+			continue
+		}
+
+		indexName := generateIndexName(index.Name)
+
+		columnNames := make([]string, 0, len(ColumnOrder))
+
 		for i := range index.Key {
 			field := index.Key[i].Field
+			field = columnNameCharacters.ReplaceAllString(strings.ToLower(field), "_")
 
-			if strings.Contains(field, ".") {
-				field = strings.ReplaceAll(field, ".", "")
-			}
-			//field = specialCharacters.ReplaceAllString(strings.ToLower(field), "_")
+			columns := make([]options.AlterTableOption, 0, len(ColumnOrder))
+			for _, suffix := range ColumnOrder {
+				columnName := fmt.Sprintf("%s_%s", field, suffix)
+				columns = append(columns, options.WithAddColumn(columnName, ydbTypes.Optional(ColumnStoreToYdbType(suffix))))
+				columnNames = append(columnNames, columnName)
 
-			columns := make([]options.AlterTableOption, 0, len(supported))
-			for _, bsonType := range definedOrder {
-				if t, ok := supported[bsonType]; ok {
-					columnName := fmt.Sprintf("%s_%s", field, bsonType)
-					columns = append(columns, options.WithAddColumn(columnName, ydbTypes.Optional(t)))
-					columnNames = append(columnNames, columnName)
-				}
 			}
 
-			if _, exists := allFields[field]; exists {
+			if _, exists := existingFields[field]; exists {
 				continue
 			}
 
-			err = addFieldColumns(ctx, r.D.Driver.Table(), ydbPath, c.TableName, columns)
+			err = addFieldColumns(ctx, r.D.Driver.Table(), ydbPath, targetColl.TableName, columns)
 			if err != nil {
 				return lazyerrors.Error(err)
 			}
 
-			allFields[field] = index.Name
+			existingFields[field] = index.Name
 		}
 
 		if len(columnNames) > 0 {
-			err = addIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, columnNames, index.Name)
+			err = addIndex(ctx, r.D.Driver.Table(), ydbPath, targetColl.TableName, columnNames, indexName)
 			if err != nil {
 				return lazyerrors.Error(err)
 			}
 		}
 
 		index.Ready = false
-		created = append(created, index.Name)
-		c.Indexes = append(c.Indexes, index)
+		index.SanitizedName = indexName
+		targetColl.Indexes = append(targetColl.Indexes, index)
 		allIndexes[index.Name] = collectionName
 	}
 
-	b, err := json.Marshal(c)
+	b, err := json.Marshal(targetColl)
 	if err != nil {
 		return lazyerrors.Error(err)
 	}
@@ -675,7 +747,8 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		TableName:       metadataTableName,
 	})
 
-	id := uuid.MustParse(c.UUID)
+	var p Placeholder
+
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			_, _, err = s.Execute(
@@ -683,8 +756,8 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 				transaction.WriteTx,
 				q,
 				table.NewQueryParameters(
-					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-					table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
+					table.ValueParam(p.Named("id"), ydbTypes.BytesValueFromString(collectionName)),
+					table.ValueParam(p.Named("json"), ydbTypes.JSONValueFromBytes(b)),
 				))
 			return err
 		})
@@ -693,14 +766,17 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 		return lazyerrors.Error(err)
 	}
 
-	r.colls[dbName][collectionName] = c
+	r.colls[dbName][collectionName] = targetColl
 
-	for _, index := range indexes {
+	for _, index := range indexesReq {
+		if index.Unique {
+			continue
+		}
 		go func(index IndexInfo, coll *Collection, ydbPath string) {
 			childCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
-			err := migrateIndexData(childCtx, r.D.Driver.Table(), ydbPath, coll.TableName, index.Key)
+			err := migrateIndexData(childCtx, r.D.Driver, ydbPath, coll.TableName, index.Key)
 			if err != nil {
 				fmt.Printf("index migration failed: %v\n", err)
 				return
@@ -722,7 +798,7 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 				TableName:       metadataTableName,
 			})
 
-			id := uuid.MustParse(coll.UUID)
+			var p Placeholder
 
 			_ = r.D.Driver.Table().Do(childCtx, func(ctx context.Context, s table.Session) error {
 				_, _, err := s.Execute(
@@ -730,13 +806,13 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 					transaction.WriteTx,
 					q,
 					table.NewQueryParameters(
-						table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-						table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
+						table.ValueParam(p.Named("id"), ydbTypes.BytesValueFromString(collectionName)),
+						table.ValueParam(p.Named("json"), ydbTypes.JSONValueFromBytes(b)),
 					))
 				return err
 			})
 
-		}(index, c, ydbPath)
+		}(index, targetColl, ydbPath)
 	}
 
 	return nil
@@ -748,13 +824,13 @@ func (r *Registry) indexesCreate(ctx context.Context, dbName, collectionName str
 //
 // If database or collection does not exist, nil is returned.
 func (r *Registry) IndexesDrop(ctx context.Context, dbName, collectionName string, indexNames []string) error {
-	err := r.LoadMetadata(ctx, dbName)
+	err := r.LoadCollectionMetadata(ctx, dbName, collectionName)
 	if err != nil {
 		return lazyerrors.Error(err)
 	}
 
-	r.rw.Lock()
-	defer r.rw.Unlock()
+	r.Rw.Lock()
+	defer r.Rw.Unlock()
 
 	return r.indexesDrop(ctx, dbName, collectionName, indexNames)
 }
@@ -780,7 +856,7 @@ func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName strin
 			continue
 		}
 
-		err := dropIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, name)
+		err := dropIndex(ctx, r.D.Driver.Table(), ydbPath, c.TableName, c.Indexes[i].SanitizedName)
 		if err != nil {
 			return lazyerrors.Error(err)
 		}
@@ -801,12 +877,11 @@ func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName strin
 		}
 	}
 
-	supported := GetSupportedIndexTypes()
-	columns := make([]options.AlterTableOption, 0, len(supported))
+	columns := make([]options.AlterTableOption, 0, len(ColumnOrder))
 	for field := range fieldsPlanToDelete {
-		fieldName := strings.ReplaceAll(field, ".", "")
-		for b, _ := range supported {
-			columnName := fmt.Sprintf("%s_%s", fieldName, b)
+		fieldName := columnNameCharacters.ReplaceAllString(field, "_")
+		for _, colType := range ColumnOrder {
+			columnName := fmt.Sprintf("%s_%s", fieldName, colType)
 			columns = append(columns, options.WithDropColumn(columnName))
 		}
 	}
@@ -818,7 +893,6 @@ func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName strin
 		}
 	}
 
-	id := uuid.MustParse(c.UUID)
 	b, err := json.Marshal(c)
 	if err != nil {
 		return lazyerrors.Error(err)
@@ -829,6 +903,8 @@ func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName strin
 		TableName:       metadataTableName,
 	})
 
+	var p Placeholder
+
 	err = r.D.Driver.Table().Do(ctx,
 		func(ctx context.Context, s table.Session) (err error) {
 			_, _, err = s.Execute(
@@ -836,8 +912,8 @@ func (r *Registry) indexesDrop(ctx context.Context, dbName, collectionName strin
 				transaction.WriteTx,
 				q,
 				table.NewQueryParameters(
-					table.ValueParam("$meta_id", ydbTypes.UuidValue(id)),
-					table.ValueParam("$json", ydbTypes.JSONValueFromBytes(b)),
+					table.ValueParam(p.Named("id"), ydbTypes.BytesValueFromString(collectionName)),
+					table.ValueParam(p.Named("json"), ydbTypes.JSONValueFromBytes(b)),
 				))
 			return err
 		})
@@ -859,8 +935,8 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 // Collect implements prometheus.Collector.
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 
-	r.rw.RLock()
-	defer r.rw.RUnlock()
+	r.Rw.RLock()
+	defer r.Rw.RUnlock()
 
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(

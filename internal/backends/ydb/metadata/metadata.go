@@ -1,25 +1,22 @@
 package metadata
 
 import (
+	"fmt"
 	"github.com/FerretDB/FerretDB/internal/backends"
-	"regexp"
+	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
 )
 
 const (
 	// YDB table name where FerretDB metadata is stored.
 	metadataTableName = backends.ReservedPrefix + "database_metadata"
-
-	maxObjectNameLength = 255
 	// DefaultColumn is a column name for all fields.
 	DefaultColumn   = "_jsonb"
-	DefaultIDColumn = "id"
-
+	DefaultIdColumn = "id"
+	IdHashColumn    = "id_hash"
+	IdMongoField    = "_id"
 	// RecordIDColumn is a name for RecordID column to store capped collection record id.
 	RecordIDColumn = backends.ReservedPrefix + "record_id"
 )
-
-// specialCharacters are unsupported characters of YDB scheme object name that are replaced with `_`.
-var specialCharacters = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 // Collection represents collection metadata.
 //
@@ -27,7 +24,6 @@ var specialCharacters = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 // Use [deepCopy] to replace the whole value instead of modifying fields of existing value.
 type Collection struct {
 	Name      string
-	UUID      string
 	TableName string
 	Indexes   Indexes
 	Settings  Settings
@@ -41,7 +37,6 @@ func (c *Collection) deepCopy() *Collection {
 
 	return &Collection{
 		Name:      c.Name,
-		UUID:      c.UUID,
 		TableName: c.TableName,
 		Indexes:   c.Indexes.deepCopy(),
 		Settings:  *c.Settings.deepCopy(),
@@ -67,6 +62,31 @@ func (s *Settings) deepCopy() *Settings {
 }
 
 // Capped returns true if collection is capped.
-func (c Collection) Capped() bool {
+func (c *Collection) Capped() bool {
 	return c.Settings.CappedSize > 0
+}
+
+type PrimaryKeyColumn struct {
+	Name string
+	Type ydbTypes.Type
+}
+
+func BuildPrimaryKeyColumns() []PrimaryKeyColumn {
+	var columns []PrimaryKeyColumn
+
+	columns = []PrimaryKeyColumn{
+		{Name: IdHashColumn, Type: ydbTypes.TypeUint64},
+	}
+
+	for _, suffix := range ColumnOrder {
+		columnName := fmt.Sprintf("%s_%s", IdMongoField, suffix)
+		columnType := ydbTypes.Optional(ColumnStoreToYdbType(suffix))
+
+		columns = append(columns, PrimaryKeyColumn{
+			Name: columnName,
+			Type: columnType,
+		})
+	}
+
+	return columns
 }

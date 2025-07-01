@@ -37,8 +37,13 @@ func TestVersion(t *testing.T) {
 			t.Parallel()
 
 			s := b.sp.Get()
-			assert.Empty(t, s.BackendName)
-			assert.Empty(t, s.BackendVersion)
+			if name == "ydb" {
+				require.NotEmpty(t, s.BackendName)
+				assert.Equal(t, "24.4.4.2", s.BackendVersion)
+			} else {
+				assert.Empty(t, s.BackendName)
+				assert.Empty(t, s.BackendVersion)
+			}
 
 			db, err := b.Database(testutil.DatabaseName(t))
 			require.NoError(t, err)
@@ -58,6 +63,8 @@ func TestVersion(t *testing.T) {
 				assert.Equal(t, "3.46.0", s.BackendVersion)
 			case "hana":
 				assert.Equal(t, "4.00.000.00.1693911223", s.BackendVersion)
+			case "YDB":
+				assert.Equal(t, "24.4.4.2", s.BackendVersion)
 			default:
 				t.Fatalf("unknown backend: %s", name)
 			}

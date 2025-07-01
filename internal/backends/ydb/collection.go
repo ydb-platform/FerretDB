@@ -9,7 +9,6 @@ import (
 	"github.com/FerretDB/FerretDB/internal/types"
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/must"
-	"github.com/ydb-platform/ydb-go-genproto/protos/Ydb"
 	"github.com/ydb-platform/ydb-go-sdk/v3"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
@@ -40,14 +39,12 @@ func newCollection(r *metadata.Registry, dbName, name string) backends.Collectio
 
 // Query implements backends.Collection interface.
 func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*backends.QueryResult, error) {
-	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	db, err := c.r.DatabaseGetExisting(ctx, c.dbName)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
-	ydbPath := c.r.DbMapping[c.dbName]
-
-	if p == nil {
+	if db == nil {
 		return &backends.QueryResult{
 			Iter: NewQueryIterator(ctx, nil, params.OnlyRecordIDs),
 		}, nil
@@ -64,7 +61,13 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 		}, nil
 	}
 
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
 	var builder strings.Builder
+	var p metadata.Placeholder
+	var args []table.ParameterOption
 
 	builder.WriteString(fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n", ydbPath))
 
@@ -76,45 +79,52 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 		OnlyRecordIDs: params.OnlyRecordIDs,
 	})
 
-	where, args, useIndex, err := prepareWhereClause(params.Filter, meta)
+	where, whereArgs, useIndex, err := prepareWhereClause(params.Filter, meta, &p)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
+	args = append(args, whereArgs...)
+
+	limitParamName, limitArgs := prepareLimitClause(params, &p)
+	args = append(args, limitArgs)
+
+	orderByClause := prepareOrderByClause(params.Sort)
 
 	var declareParts []string
-	if len(*args) > 0 {
-		declareParts = make([]string, len(*args))
-		for i, param := range *args {
+	if len(args) > 0 {
+		declareParts = make([]string, len(args))
+		for i, param := range args {
 			paramName := param.Name()
 			paramValue := param.Value()
-			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String())
+			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;\n", paramName, paramValue.Type().String())
 		}
 	}
 
 	if len(declareParts) > 0 {
-		builder.WriteString(strings.Join(declareParts, "\n"))
+		builder.WriteString(strings.Join(declareParts, ""))
 	}
 
 	builder.WriteString(selectClause)
 
-	if useIndex.idxName != nil {
-		builder.WriteString(fmt.Sprintf(" VIEW %s", *useIndex.idxName))
+	if useIndex != nil {
+		if useIndex.idxName != nil {
+			builder.WriteString(fmt.Sprintf(" %s %s", ViewWord, *useIndex.idxName))
+		}
 	}
 
-	if len(*args) > 0 {
-		builder.WriteString(" WHERE " + where)
+	if len(whereArgs) > 0 {
+		builder.WriteString(fmt.Sprintf(" %s %s ", WhereWord, where))
 	}
 
-	sort := prepareOrderByClause(params.Sort)
-	builder.WriteString(sort)
+	builder.WriteString(orderByClause)
 
-	if params.Limit != 0 {
-		builder.WriteString(fmt.Sprintf(" LIMIT %d", params.Limit))
-	} else {
-		builder.WriteString(fmt.Sprintf(" LIMIT %d", defaultRowsLimit))
+	if limitArgs != nil {
+		builder.WriteString(fmt.Sprintf(" %s %s", LimitWord, limitParamName))
 	}
 
+	qp := table.NewQueryParameters(args...)
 	q := builder.String()
+	fmt.Println("query", q)
 
 	var res result.Result
 	err = c.r.D.Driver.Table().Do(ctx,
@@ -123,7 +133,7 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 				return err
 			}
 
-			_, res, err = session.Execute(ctx, transaction.ReadTx, q, args)
+			_, res, err = session.Execute(ctx, transaction.OnlineReadTx, q, qp)
 			if err != nil {
 				return err
 			}
@@ -144,14 +154,14 @@ func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*
 }
 
 func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams) (*backends.ExplainResult, error) {
-	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	db, err := c.r.DatabaseGetExisting(ctx, c.dbName)
 	if err != nil {
 		return &backends.ExplainResult{
 			QueryPlanner: must.NotFail(types.NewDocument()),
 		}, nil
 	}
 
-	if p == nil {
+	if db == nil {
 		return &backends.ExplainResult{
 			QueryPlanner: must.NotFail(types.NewDocument()),
 		}, nil
@@ -178,23 +188,28 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 
 	var plan string
 
+	c.r.Rw.RLock()
 	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
 
 	var builder strings.Builder
+	var p metadata.Placeholder
 
 	builder.WriteString(fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n", ydbPath))
 
 	selectClause := prepareSelectClause(opts)
 
-	where, args, useIndex, err := prepareWhereClause(params.Filter, meta)
+	where, args, useIndex, err := prepareWhereClause(params.Filter, meta, &p)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
+	res.FilterPushdown = where != ""
+
 	var declareParts []string
-	if len(*args) > 0 {
-		declareParts = make([]string, len(*args))
-		for i, param := range *args {
+	if len(args) > 0 {
+		declareParts = make([]string, len(args))
+		for i, param := range args {
 			paramName := param.Name()
 			paramValue := param.Value()
 			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String())
@@ -207,22 +222,28 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 
 	builder.WriteString(selectClause)
 
-	if useIndex.idxName != nil {
-		builder.WriteString(fmt.Sprintf(" VIEW %s", *useIndex.idxName))
+	if useIndex != nil {
+		if useIndex.idxName != nil {
+			builder.WriteString(fmt.Sprintf(" %s %s", ViewWord, *useIndex.idxName))
+		}
 	}
 
-	if len(*args) > 0 {
-		builder.WriteString(" WHERE " + where)
+	if len(args) > 0 {
+		builder.WriteString(fmt.Sprintf(" %s %s ", WhereWord, where))
 	}
 
-	sort := prepareOrderByClause(params.Sort)
-	builder.WriteString(sort)
+	orderByClause := prepareOrderByClause(params.Sort)
+	res.SortPushdown = orderByClause != ""
+
+	builder.WriteString(orderByClause)
 
 	if params.Limit != 0 {
 		builder.WriteString(fmt.Sprintf(" LIMIT %d", params.Limit))
 	} else {
 		builder.WriteString(fmt.Sprintf(" LIMIT %d", defaultRowsLimit))
 	}
+
+	res.LimitPushdown = true
 
 	q := builder.String()
 
@@ -241,7 +262,7 @@ func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams
 		table.WithIdempotent(),
 	)
 	if err != nil {
-		panic(err)
+		return nil, lazyerrors.Error(err)
 	}
 
 	queryPlan, err := UnmarshalExplain(plan)
@@ -259,12 +280,15 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 		return nil, lazyerrors.Error(err)
 	}
 
-	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	meta, err := c.r.CollectionGetCopy(c.dbName, c.name)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
+	c.r.Rw.RLock()
 	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
 	batchSize := c.r.BatchSize
 	if batchSize < 1 {
 		panic("batch-size should be greater or equal to 1")
@@ -280,7 +304,7 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 
 		for _, doc := range batch {
 			extraColumns = metadata.ExtractIndexFields(doc, meta.Indexes)
-			documentsData = append(documentsData, SingleDocumentData(doc, extraColumns, meta.Capped()))
+			documentsData = append(documentsData, singleDocumentData(doc, extraColumns, meta.Capped()))
 		}
 
 		docs = rest
@@ -288,16 +312,17 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 
 	q := buildInsertQuery(ydbPath, meta.TableName, meta.Capped(), extraColumns)
 
-	err = c.r.D.Driver.Table().DoTx(
+	err = c.r.D.Driver.Table().Do(
 		ctx,
-		func(ctx context.Context, tx table.TransactionActor) (err error) {
-
-			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
+		func(ctx context.Context, session table.Session) (err error) {
+			_, res, err := session.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
 				table.ValueParam("$insertData", ydbTypes.ListValue(documentsData...))),
 			)
+
 			if err != nil {
 				return err
 			}
+
 			if err = res.Err(); err != nil {
 				return err
 			}
@@ -307,7 +332,7 @@ func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllPa
 	)
 
 	if err != nil {
-		if ydb.IsOperationError(err, Ydb.StatusIds_PRECONDITION_FAILED) {
+		if metadata.IsOperationErrorConflictExistingKey(err) {
 			return nil, backends.NewError(backends.ErrorCodeInsertDuplicateID, err)
 		}
 		return nil, lazyerrors.Error(err)
@@ -334,31 +359,44 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 		return &backends.DeleteAllResult{Deleted: 0}, nil
 	}
 
-	ids := prepareIDs(params)
-	ydbPath := c.r.DbMapping[c.dbName]
+	ids := prepareIds(params)
+	fmt.Println("ids to dleete", ids)
+	fmt.Println("params", params.RecordIDs, params.IDs)
 
-	config := metadata.NewDeleteConfig(ydbPath, colMeta.TableName, params)
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	var primaryKeyColumns = metadata.BuildPrimaryKeyColumns()
+	primaryKeyColumnNames := make([]string, len(primaryKeyColumns))
+
+	for i := range primaryKeyColumns {
+		primaryKeyColumnNames[i] = primaryKeyColumns[i].Name
+	}
+
+	config := metadata.NewDeleteConfig(ydbPath, colMeta.TableName, primaryKeyColumnNames, params)
 
 	q, err := metadata.Render(metadata.DeleteTmpl, config)
 	if err != nil {
 		return nil, lazyerrors.Error(err)
 	}
 
+	fmt.Println("delete", q)
+
+	var p *metadata.Placeholder
+
 	var deletedCount uint64
 
-	err = c.r.D.Driver.Table().DoTx(ctx,
-		func(ctx context.Context, tx table.TransactionActor) (err error) {
-			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
-				table.ValueParam("$IDs", ydbTypes.ListValue(ids...)),
+	err = c.r.D.Driver.Table().Do(
+		ctx,
+		func(ctx context.Context, session table.Session) (err error) {
+			_, res, err := session.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
+				table.ValueParam(p.Named("IDs"), ydbTypes.ListValue(ids...)),
 			))
 
 			if err != nil {
 				return err
 			}
-
-			defer func() {
-				_ = res.Close()
-			}()
 
 			if err = res.Err(); err != nil {
 				return err
@@ -378,10 +416,9 @@ func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllPa
 				}
 			}
 
-			return nil
+			return res.Close()
 
 		},
-		table.WithIdempotent(),
 	)
 
 	if err != nil {
@@ -408,7 +445,9 @@ func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllPa
 		return &backends.UpdateAllResult{}, nil
 	}
 
+	c.r.Rw.RLock()
 	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
 
 	docs := params.Docs
 	documentsData := make([]ydbTypes.Value, 0, len(docs))
@@ -416,15 +455,16 @@ func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllPa
 	extraColumns := make(map[string]metadata.IndexColumn)
 	for _, doc := range docs {
 		extraColumns = metadata.ExtractIndexFields(doc, colMeta.Indexes)
-		documentsData = append(documentsData, SingleDocumentData(doc, extraColumns, colMeta.Capped()))
+		documentsData = append(documentsData, singleDocumentData(doc, extraColumns, colMeta.Capped()))
 	}
 
 	q := buildUpsertQuery(ydbPath, colMeta.TableName, extraColumns)
 
-	err = c.r.D.Driver.Table().DoTx(
+	fmt.Println("upsert", q)
+	err = c.r.D.Driver.Table().Do(
 		ctx,
-		func(ctx context.Context, tx table.TransactionActor) (err error) {
-			res, err := tx.Execute(ctx, q, table.NewQueryParameters(
+		func(ctx context.Context, session table.Session) (err error) {
+			_, res, err := session.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
 				table.ValueParam("$insertData", ydbTypes.ListValue(documentsData...))),
 			)
 			if err != nil {
@@ -471,7 +511,9 @@ func (c *collection) Stats(ctx context.Context, params *backends.CollectionStats
 		)
 	}
 
+	c.r.Rw.RLock()
 	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
 
 	stats, err := collectionsStats(ctx, c.r.D.Driver, ydbPath, []*metadata.Collection{coll}, params.Refresh)
 	if err != nil {
@@ -532,7 +574,7 @@ func collectionsStats(ctx context.Context, driver *ydb.Driver, ydbPath string, l
 					SELECT SUM(CurrentAvailableSize) AS CurrentAvailableSize 
     				FROM ` + "`.sys/ds_storage_stats`" + `
 				) AS storage;`
-				_, res, err := s.Execute(ctx, transaction.ReadTx, q,
+				_, res, err := s.Execute(ctx, transaction.OnlineReadTx, q,
 					table.NewQueryParameters(table.ValueParam("$tablePath", ydbTypes.UTF8Value(tablePath))),
 				)
 

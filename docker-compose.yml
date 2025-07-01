@@ -122,7 +122,6 @@ services:
       - TZ=Asia/Kathmandu
       - MONGO_INITDB_ROOT_USERNAME=username
       - MONGO_INITDB_ROOT_PASSWORD=password
-      - FERRETDB_TEST_ENABLE_NEW_AUTH=true
     volumes:
       - ./build/certs:/etc/certs
       - ./build/mongodb_secured.conf:/etc/mongodb.conf

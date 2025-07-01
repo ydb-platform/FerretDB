@@ -4,6 +4,7 @@ package metadata
 type CollectionCreateParams struct {
 	DBName          string
 	Name            string
+	Indexes         []IndexInfo
 	CappedSize      int64
 	CappedDocuments int64
 	_               struct{} // prevent unkeyed literals

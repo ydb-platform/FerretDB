@@ -221,6 +221,7 @@ func ValidateProjection(projection *types.Document) (*types.Document, bool, erro
 	return validated, *inclusion, nil
 }
 
+// TODO: this is extremely time and memory consuming operation (can be up to 50 milliseconds), need to explore and optimize code
 // ProjectDocument applies projection to the copy of the document.
 // It returns proper CommandError that can be returned by $project aggregation stage.
 //

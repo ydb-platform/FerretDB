@@ -51,6 +51,7 @@ type projectionIterator struct {
 	inclusion  bool
 }
 
+// TODO: this is extremely time and memory consuming operation (can be up to 50 milliseconds), need to explore and optimize code
 // Next implements iterator.Interface. See ProjectionIterator for details.
 func (iter *projectionIterator) Next() (struct{}, *types.Document, error) {
 	var unused struct{}

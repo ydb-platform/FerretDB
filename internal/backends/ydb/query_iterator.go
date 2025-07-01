@@ -27,14 +27,14 @@ type queryIterator struct {
 	onlyRecordIDs bool
 }
 
-// NewQueryIterator returns a new queryIterator for the given Rows.
+// NewQueryIterator returns a new queryIterator for the given ResultSet.
 //
-// Iterator's Close method closes rows.
+// Iterator's Close method closes result.
 // They are also closed by the Next method on any error, including context cancellation,
 // to make sure that the database connection is released as early as possible.
 // In that case, the iterator's Close method should still be called.
 //
-// Nil rows are possible and return already done iterator.
+// Nil result is possible and return already done iterator.
 // It still should be Closed.
 func NewQueryIterator(ctx context.Context, rs result.Result, onlyRecordIDs bool) types.DocumentsIterator {
 	iter := &queryIterator{
@@ -60,8 +60,6 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 		return unused, nil, iterator.ErrIteratorDone
 	}
 
-	defer iter.rs.Close()
-
 	if err := context.Cause(iter.ctx); err != nil {
 		iter.close()
 		return unused, nil, lazyerrors.Error(err)
@@ -80,13 +78,12 @@ func (iter *queryIterator) Next() (struct{}, *types.Document, error) {
 	}
 
 	set := iter.rs.CurrentResultSet()
-	columnCount := set.ColumnCount()
 
 	var recordID int64
 	var b []byte
 	var dest []indexed.Required
 
-	columns := make([]string, columnCount)
+	columns := make([]string, set.ColumnCount())
 	set.Columns(func(col options.Column) {
 		columns = append(columns, col.Name)
 	})
@@ -134,6 +131,9 @@ func (iter *queryIterator) Close() {
 //
 // This should be called only when the caller already holds the mutex.
 func (iter *queryIterator) close() {
+	if iter.rs != nil {
+		iter.rs.Close()
+	}
 
 	resource.Untrack(iter, iter.token)
 }

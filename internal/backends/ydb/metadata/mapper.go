@@ -5,84 +5,199 @@ import (
 	"github.com/FerretDB/FerretDB/internal/types"
 	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"math"
+	"strconv"
 	"time"
 )
 
-func GetSupportedIndexTypes() map[string]ydbTypes.Type {
-	return map[string]ydbTypes.Type{
-		"string":   ydbTypes.TypeString,
-		"objectId": ydbTypes.TypeString,
-		"bool":     ydbTypes.TypeBool,
-		"date":     ydbTypes.TypeInt64,
-		"long":     ydbTypes.TypeInt64,
-		"int":      ydbTypes.TypeInt32,
-		"double":   ydbTypes.TypeInt64, // when double can be represented as int64
+type ColumnAlias string
+
+const (
+	ColumnString   ColumnAlias = "string"
+	ColumnObjectId ColumnAlias = "objectId"
+	ColumnBool     ColumnAlias = "bool"
+	ColumnDate     ColumnAlias = "date"
+	ColumnScalar   ColumnAlias = "scalar"
+)
+
+type BsonType string
+
+const (
+	BsonString   BsonType = "string"
+	BsonObjectId BsonType = "objectId"
+	BsonBool     BsonType = "bool"
+	BsonDate     BsonType = "date"
+	BsonInt      BsonType = "int"
+	BsonLong     BsonType = "long"
+	BsonDouble   BsonType = "double"
+)
+
+var (
+	ColumnOrder = []ColumnAlias{
+		ColumnString,
+		ColumnObjectId,
+		ColumnScalar,
+		ColumnDate,
+		ColumnBool,
 	}
+
+	bsonTypeToColumnStore = map[BsonType]ColumnAlias{
+		BsonString:   ColumnString,
+		BsonObjectId: ColumnObjectId,
+		BsonBool:     ColumnBool,
+		BsonDate:     ColumnDate,
+		BsonInt:      ColumnScalar,
+		BsonLong:     ColumnScalar,
+		BsonDouble:   ColumnScalar,
+	}
+
+	bsonToYdbType = map[BsonType]ydbTypes.Type{
+		BsonString:   ydbTypes.TypeString,
+		BsonObjectId: ydbTypes.TypeString,
+		BsonInt:      ydbTypes.TypeDyNumber,
+		BsonLong:     ydbTypes.TypeDyNumber,
+		BsonDouble:   ydbTypes.TypeDyNumber,
+		BsonBool:     ydbTypes.TypeBool,
+		BsonDate:     ydbTypes.TypeInt64,
+	}
+
+	columnStoreToYdbType = map[ColumnAlias]ydbTypes.Type{
+		ColumnString:   ydbTypes.TypeString,
+		ColumnObjectId: ydbTypes.TypeString,
+		ColumnBool:     ydbTypes.TypeBool,
+		ColumnDate:     ydbTypes.TypeInt64,
+		ColumnScalar:   ydbTypes.TypeDyNumber,
+	}
+)
+
+var IndexedBsonTypes = map[BsonType]struct{}{
+	BsonString:   {},
+	BsonObjectId: {},
+	BsonBool:     {},
+	BsonDate:     {},
+	BsonLong:     {},
+	BsonDouble:   {},
+	BsonInt:      {},
 }
 
-func MapBSONTypeToYDBType(bsonType string) ydbTypes.Type {
-	switch bsonType {
-	case "string", "objectId":
-		return ydbTypes.TypeString
-	case "int":
-		return ydbTypes.TypeInt32
-	case "long":
-		return ydbTypes.TypeInt64
-	case "double":
-		return ydbTypes.TypeDouble
-	case "bool":
-		return ydbTypes.TypeBool
-	case "date":
-		return ydbTypes.TypeInt64
-	default:
-		return nil
+func BsonTypeToYdbType(bsonType BsonType) ydbTypes.Type {
+	if t, ok := bsonToYdbType[bsonType]; ok {
+		return t
 	}
+
+	return nil
 }
 
-func MapBSONValueToYDBValueForJsonQuery(bsonType string, val any) ydbTypes.Value {
-	switch bsonType {
-	case "string":
+func BsonTypeToColumnStore(bsonType BsonType) ColumnAlias {
+	if col, ok := bsonTypeToColumnStore[bsonType]; ok {
+		return col
+	}
+
+	return ""
+}
+
+func ColumnStoreToYdbType(col ColumnAlias) ydbTypes.Type {
+	if t, ok := columnStoreToYdbType[col]; ok {
+		return t
+	}
+
+	return nil
+}
+
+var scalarTypes = map[BsonType]struct{}{
+	BsonInt:    {},
+	BsonLong:   {},
+	BsonDouble: {},
+}
+
+func isScalar(colType BsonType) bool {
+	_, ok := scalarTypes[colType]
+	return ok
+}
+
+type converterFunc func(val any) ydbTypes.Value
+
+var convertersForJsonQuery = map[BsonType]converterFunc{
+	BsonString: func(val any) ydbTypes.Value {
 		return ydbTypes.UTF8Value(val.(string))
-	case "objectId":
+	},
+	BsonObjectId: func(val any) ydbTypes.Value {
 		oid := val.(types.ObjectID)
 		return ydbTypes.UTF8Value(hex.EncodeToString(oid[:]))
-	case "int":
+	},
+	BsonInt: func(val any) ydbTypes.Value {
 		return ydbTypes.Int32Value(val.(int32))
-	case "long":
+	},
+	BsonLong: func(val any) ydbTypes.Value {
 		return ydbTypes.Int64Value(val.(int64))
-	case "double":
+	},
+	BsonDouble: func(val any) ydbTypes.Value {
 		return ydbTypes.DoubleValue(val.(float64))
-	case "bool":
+	},
+	BsonBool: func(val any) ydbTypes.Value {
 		return ydbTypes.BoolValue(val.(bool))
-	case "date":
+	},
+	BsonDate: func(val any) ydbTypes.Value {
 		v := val.(time.Time)
 		date := primitive.NewDateTimeFromTime(v)
 		return ydbTypes.Int64Value(int64(date))
-	default:
-		return nil
-	}
+	},
 }
 
-func MapBSONValueToYDBValue(bsonType string, val any) ydbTypes.Value {
-	switch bsonType {
-	case "string":
+var convertersForColumnQuery = map[BsonType]converterFunc{
+	BsonString: func(val any) ydbTypes.Value {
 		return ydbTypes.BytesValueFromString(val.(string))
-	case "objectId":
+	},
+	BsonObjectId: func(val any) ydbTypes.Value {
 		oid := val.(types.ObjectID)
 		return ydbTypes.BytesValueFromString(hex.EncodeToString(oid[:]))
-	case "int":
-		return ydbTypes.Int32Value(val.(int32))
-	case "long":
-		return ydbTypes.Int64Value(val.(int64))
-	case "double":
-		return ydbTypes.DoubleValue(val.(float64))
-	case "bool":
+	},
+	BsonInt: func(val any) ydbTypes.Value {
+		i := val.(int32)
+		s := strconv.FormatInt(int64(i), 10)
+		return ydbTypes.DyNumberValue(s)
+	},
+	BsonLong: func(val any) ydbTypes.Value {
+		i := val.(int64)
+		s := strconv.FormatInt(i, 10)
+		return ydbTypes.DyNumberValue(s)
+	},
+	BsonDouble: func(val any) ydbTypes.Value {
+		f := val.(float64)
+		s := strconv.FormatFloat(f, 'f', -1, 64)
+		return ydbTypes.DyNumberValue(s)
+	},
+	BsonBool: func(val any) ydbTypes.Value {
 		return ydbTypes.BoolValue(val.(bool))
-	case "date":
+	},
+	BsonDate: func(val any) ydbTypes.Value {
 		v := val.(time.Time)
 		date := primitive.NewDateTimeFromTime(v)
 		return ydbTypes.Int64Value(int64(date))
-	default:
-		return nil
+	},
+}
+
+func BsonValueToYdbValueForJsonQuery(bsonType BsonType, val any) ydbTypes.Value {
+	if conv, ok := convertersForJsonQuery[bsonType]; ok {
+		return conv(val)
 	}
+	return nil
+}
+
+func BsonValueToYdbValue(bsonType BsonType, val any) ydbTypes.Value {
+	if conv, ok := convertersForColumnQuery[bsonType]; ok {
+		return conv(val)
+	}
+
+	return nil
+}
+
+func float64ToOrderedUint64(f float64) uint64 {
+	temp := math.Float64bits(f)
+	tempAsInt64 := int64(temp)
+	shifted := tempAsInt64 >> 63
+	signShifted := uint64(shifted)
+	mask := signShifted | 0x8000000000000000
+
+	return temp ^ mask
 }

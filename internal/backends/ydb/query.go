@@ -3,6 +3,7 @@ package ydb
 import (
 	"errors"
 	"fmt"
+	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
 	"github.com/FerretDB/FerretDB/internal/handler/sjson"
 	"github.com/FerretDB/FerretDB/internal/types"
@@ -10,6 +11,7 @@ import (
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/must"
 	"github.com/ydb-platform/ydb-go-sdk/v3/table"
+	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
 	"strings"
 	"time"
 )
@@ -18,11 +20,11 @@ const (
 	jsonPathRoot = "$"
 )
 
-type FieldOp string
+type MongoOp string
 
 const (
-	FieldOpEq FieldOp = "$eq"
-	FieldOpNe FieldOp = "$ne"
+	FieldOpEq MongoOp = "$eq"
+	FieldOpNe MongoOp = "$ne"
 )
 
 type CompareOp string
@@ -34,26 +36,27 @@ const (
 	CompareOpLt CompareOp = "<"
 )
 
-var pushdownOperators = map[FieldOp]CompareOp{
+var pushdownOperators = map[MongoOp]CompareOp{
 	FieldOpEq: CompareOpEq,
 	FieldOpNe: CompareOpNe,
 }
 
-var operatorsSupportedForIndexing = map[FieldOp]CompareOp{
+// TODO: this is the only operators which is supported for indexed search queries using columns
+var operatorsSupportedForIndexing = map[MongoOp]CompareOp{
 	FieldOpEq: CompareOpEq,
 }
 
 func IsSupportedForPushdown(opStr string) bool {
-	op := FieldOp(opStr)
+	op := MongoOp(opStr)
 	_, ok := pushdownOperators[op]
 	return ok
 }
 
-func GetCompareOp(op FieldOp) CompareOp {
+func GetCompareOp(op MongoOp) CompareOp {
 	return pushdownOperators[op]
 }
 
-func IsIndexable(op FieldOp) bool {
+func IsIndexableOp(op MongoOp) bool {
 	_, ok := operatorsSupportedForIndexing[op]
 	return ok
 }
@@ -64,18 +67,17 @@ type secondaryIndex struct {
 
 type whereExpressionParams struct {
 	rootKey       string
-	bsonType      string
-	paramName     string
+	bsonType      metadata.BsonType
 	path          string
-	mongoOperator FieldOp
-	indexName     *string
+	mongoOperator MongoOp
+	useIndex      bool
 	value         any
 }
 
 type conditionExpressionResult struct {
-	YQLExpression string
-	ParamOption   table.ParameterOption
-	SecondaryIdx  *secondaryIndex
+	Expression   string
+	ParamOptions []table.ParameterOption
+	SecondaryIdx *secondaryIndex
 }
 
 func prepareSelectClause(params *metadata.SelectParams) string {
@@ -91,35 +93,39 @@ func prepareSelectClause(params *metadata.SelectParams) string {
 
 	if params.Capped && params.OnlyRecordIDs {
 		return fmt.Sprintf(
-			"SELECT %s %s FROM `%s`",
+			"%s %s %s %s `%s`",
+			SelectWord,
 			params.Comment,
 			metadata.RecordIDColumn,
+			FromWord,
 			params.Table,
 		)
 	}
 
 	if params.Capped {
 		return fmt.Sprintf(
-			"SELECT %s %s, %s FROM `%s`",
-
+			"%s %s %s, %s %s `%s`",
+			SelectWord,
 			params.Comment,
 			metadata.RecordIDColumn,
 			metadata.DefaultColumn,
+			FromWord,
 			params.Table,
 		)
 	}
 
 	return fmt.Sprintf(
-		"SELECT %s %s FROM `%s`",
-
+		"%s %s %s %s `%s`",
+		SelectWord,
 		params.Comment,
 		metadata.DefaultColumn,
+		FromWord,
 		params.Table,
 	)
 
 }
 
-func prepareWhereClause(sqlFilters *types.Document, meta *metadata.Collection) (string, *table.QueryParameters, *secondaryIndex, error) {
+func prepareWhereClause(sqlFilters *types.Document, meta *metadata.Collection, placeholder *metadata.Placeholder) (string, []table.ParameterOption, *secondaryIndex, error) {
 	var conditions []string
 	var args []table.ParameterOption
 	secIndex := &secondaryIndex{
@@ -150,7 +156,7 @@ func prepareWhereClause(sqlFilters *types.Document, meta *metadata.Collection) (
 		switch {
 		case err == nil:
 			if nestedPathCheck.Len() > 1 {
-				rootKey = metadata.DotNotationToJSONPath(rootKey)
+				rootKey = metadata.DotNotationToJsonPath(rootKey)
 			}
 
 		case errors.As(err, &pe):
@@ -166,9 +172,9 @@ func prepareWhereClause(sqlFilters *types.Document, meta *metadata.Collection) (
 		case types.Binary, *types.Array, types.NullType, types.Regex, types.Timestamp:
 			// not supported for pushdown
 		case int32, int64, bool, string, types.ObjectID, float64, time.Time:
-			if res := getConditionExpr(rootKey, indexes, val, FieldOpEq); res != nil {
-				conditions = append(conditions, res.YQLExpression)
-				args = append(args, res.ParamOption)
+			if res := getConditionExpr(rootKey, indexes, val, FieldOpEq, placeholder); res != nil {
+				conditions = append(conditions, res.Expression)
+				args = append(args, res.ParamOptions...)
 				secIndex = res.SecondaryIdx
 			}
 		case *types.Document:
@@ -186,9 +192,9 @@ func prepareWhereClause(sqlFilters *types.Document, meta *metadata.Collection) (
 				}
 
 				if IsSupportedForPushdown(k) {
-					if res := getConditionExpr(rootKey, indexes, v, FieldOp(k)); res != nil {
-						conditions = append(conditions, res.YQLExpression)
-						args = append(args, res.ParamOption)
+					if res := getConditionExpr(rootKey, indexes, v, MongoOp(k), placeholder); res != nil {
+						conditions = append(conditions, res.Expression)
+						args = append(args, res.ParamOptions...)
 						secIndex = res.SecondaryIdx
 					}
 				}
@@ -200,10 +206,20 @@ func prepareWhereClause(sqlFilters *types.Document, meta *metadata.Collection) (
 	}
 	query := strings.Join(conditions, " AND ")
 
-	return query, table.NewQueryParameters(args...), secIndex, nil
+	return query, args, secIndex, nil
 }
 
-func buildJSONPath(key string) string {
+func prepareLimitClause(params *backends.QueryParams, placeholder *metadata.Placeholder) (string, table.ParameterOption) {
+	limitParamName := placeholder.Next()
+
+	if params.Limit != 0 {
+		return limitParamName, table.ValueParam(limitParamName, ydbTypes.Uint64Value(uint64(params.Limit)))
+	} else {
+		return limitParamName, table.ValueParam(limitParamName, ydbTypes.Uint64Value(defaultRowsLimit))
+	}
+}
+
+func buildPathToField(key string) string {
 	key = strings.TrimSpace(key)
 
 	if key == "" {
@@ -214,7 +230,8 @@ func buildJSONPath(key string) string {
 		return fmt.Sprintf(`%s."%s"`, jsonPathRoot, key)
 	}
 
-	return fmt.Sprintf("%s.%s", jsonPathRoot, key)
+	return fmt.Sprintf(`%s.%s`, jsonPathRoot, key)
+
 }
 
 func prepareOrderByClause(sort *types.Document) string {
@@ -233,203 +250,180 @@ func prepareOrderByClause(sort *types.Document) string {
 		panic("not reachable")
 	}
 
-	return fmt.Sprintf(" ORDER BY %s%s", metadata.RecordIDColumn, order)
+	return fmt.Sprintf(" %s %s%s", OrderByWord, metadata.RecordIDColumn, order)
 }
 
-func buildYQLExpression(info whereExpressionParams) (string, table.ParameterOption) {
+func buildWhereExpression(info whereExpressionParams, placeholder *metadata.Placeholder) (string, []table.ParameterOption) {
 	operator := GetCompareOp(info.mongoOperator)
 
-	if info.indexName != nil {
-		return buildIndexedFieldExpr(info.rootKey, info.bsonType, info.paramName, operator, info.value)
+	if info.useIndex {
+		return buildIndexedFieldExpr(info.rootKey, info.bsonType, operator, info.value, placeholder)
 	}
 
-	return buildJSONFilterExpr(info.path, info.bsonType, info.paramName, info.value, info.rootKey, operator)
+	return buildJsonPathExpr(info.path, info.bsonType, info.value, info.rootKey, operator, placeholder)
 }
 
-func getConditionExpr(rootKey string, indexes []metadata.IndexInfo, val any, mongoOp FieldOp) *conditionExpressionResult {
-	bsonType := sjson.GetTypeOfValue(val)
-	ydbType := metadata.MapBSONTypeToYDBType(bsonType)
-	ydbValue := metadata.MapBSONValueToYDBValue(bsonType, val)
+func getConditionExpr(rootKey string, indexes []metadata.IndexInfo, val any, mongoOp MongoOp, placeholder *metadata.Placeholder) *conditionExpressionResult {
+	stringType := sjson.GetTypeOfValue(val)
+	bsonType := metadata.BsonType(stringType)
+	ydbType := metadata.BsonTypeToYdbType(bsonType)
+	ydbValue := metadata.BsonValueToYdbValue(bsonType, val)
 
 	if ydbType == nil || ydbValue == nil {
 		return nil
 	}
 
-	path := buildJSONPath(rootKey)
-	paramName := metadata.CleanRootKey(rootKey)
-
-	var indexName *string
-	if IsIndexable(mongoOp) && isIndexableType(bsonType) {
-		for _, in := range indexes {
-			for _, field := range in.Key {
-				if field.Field == rootKey && in.Ready {
-					indexName = &in.Name
-				}
-			}
-		}
-	}
+	path := buildPathToField(rootKey)
+	secIdx := findSecondaryIndex(rootKey, bsonType, mongoOp, indexes)
+	useIndex := secIdx != nil || rootKey == metadata.IdMongoField
 
 	expressionParams := whereExpressionParams{
-		indexName:     indexName,
+		useIndex:      useIndex,
 		rootKey:       rootKey,
 		bsonType:      bsonType,
-		paramName:     paramName,
 		path:          path,
 		mongoOperator: mongoOp,
 		value:         val,
 	}
 
-	yqlExpr, param := buildYQLExpression(expressionParams)
+	yqlExpr, param := buildWhereExpression(expressionParams, placeholder)
 
 	return &conditionExpressionResult{
-		YQLExpression: yqlExpr,
-		ParamOption:   param,
-		SecondaryIdx: &secondaryIndex{
-			idxName: indexName,
-		},
+		Expression:   yqlExpr,
+		ParamOptions: param,
+		SecondaryIdx: secIdx,
 	}
 }
 
-func buildJSONFilterExpr(path, bsonType, paramName string, val any, rootKey string, op CompareOp) (string, table.ParameterOption) {
+func findSecondaryIndex(rootKey string, bsonType metadata.BsonType, mongoOp MongoOp, indexes []metadata.IndexInfo) *secondaryIndex {
+	if rootKey == metadata.IdMongoField {
+		return nil
+	}
+
+	if !IsIndexableOp(mongoOp) || !isIndexableType(bsonType) {
+		return nil
+	}
+
+	for _, idx := range indexes {
+		if !idx.Ready {
+			continue
+		}
+		for _, fld := range idx.Key {
+			if fld.Field == rootKey {
+				return &secondaryIndex{
+					idxName: &idx.SanitizedName,
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func buildJsonPathExpr(path string, bsonType metadata.BsonType, val any, rootKey string, op CompareOp, placeholder *metadata.Placeholder) (string, []table.ParameterOption) {
+	params := make([]table.ParameterOption, 0)
 	adjustedVal := val
 
 	if op == CompareOpEq {
 		switch v := adjustedVal.(type) {
 		case int64:
-			maxSafeDouble := int64(types.MaxSafeDouble)
-
-			// If value cannot be safe double, fetch all numbers out of the safe range.
-			switch {
-			case v > maxSafeDouble:
-				op = CompareOpGt
-				adjustedVal = maxSafeDouble
-
-			case v < -maxSafeDouble:
-				op = CompareOpLt
-				adjustedVal = -maxSafeDouble
-			default:
-				// don't change the default eq query
-			}
-
+			adjustedVal, op = adjustInt64Value(v)
 		case float64:
-			switch {
-			case v > types.MaxSafeDouble:
-				op = CompareOpGt
-				adjustedVal = types.MaxSafeDouble
-
-			case v < -types.MaxSafeDouble:
-				op = CompareOpLt
-				adjustedVal = -types.MaxSafeDouble
-			default:
-				// don't change the default eq query
-			}
+			adjustedVal, op = adjustFloat64Value(v)
 		}
 	}
 
-	ydbValue := metadata.MapBSONValueToYDBValueForJsonQuery(bsonType, adjustedVal)
+	ydbValue := metadata.BsonValueToYdbValueForJsonQuery(bsonType, adjustedVal)
+	paramName := placeholder.Next()
 	param := table.ValueParam(paramName, ydbValue)
+	params = append(params, param)
 
 	if op == CompareOpNe {
-		return fmt.Sprintf(
-			`NOT JSON_EXISTS(_jsonb, '$ ? ( 
+		return getNotEqualJsonFilterExpr(rootKey, bsonType, paramName), params
+	}
+
+	return getDefaultJsonFilterExpr(path, paramName, op), params
+}
+
+func adjustInt64Value(v int64) (any, CompareOp) {
+	maxSafeDouble := int64(types.MaxSafeDouble)
+
+	switch {
+	case v > maxSafeDouble:
+		return maxSafeDouble, CompareOpGt
+	case v < -maxSafeDouble:
+		return -maxSafeDouble, CompareOpLt
+	default:
+		return v, CompareOpEq
+	}
+}
+
+func adjustFloat64Value(v float64) (any, CompareOp) {
+	switch {
+	case v > types.MaxSafeDouble:
+		return types.MaxSafeDouble, CompareOpGt
+	case v < -types.MaxSafeDouble:
+		return -types.MaxSafeDouble, CompareOpLt
+	default:
+		return v, CompareOpEq
+	}
+}
+
+func getNotEqualJsonFilterExpr(rootKey string, bsonType metadata.BsonType, paramName string) string {
+	return fmt.Sprintf(
+		`NOT JSON_EXISTS(_jsonb, '$ ? ( 
 											exists(@.%s) 
 											&& @.%s == $param 
-											&& @.\"$s\".p.%s.t == \"%s\")' PASSING $%s AS "param")`,
-			rootKey, rootKey, rootKey, bsonType, paramName,
-		), param
-	}
+											&& @.\"$s\".p.%s.t == \"%s\")' PASSING %s AS "param")`,
+		rootKey, rootKey, rootKey, bsonType, paramName,
+	)
+}
 
+func getDefaultJsonFilterExpr(path, paramName string, op CompareOp) string {
 	return fmt.Sprintf(
-		`JSON_EXISTS(_jsonb, '%s ? (@ %s $param)' PASSING $%s AS "param")`,
+		`JSON_EXISTS(_jsonb, '%s ? (@ %s $param)' PASSING %s AS "param")`,
 		path, op, paramName,
-	), param
+	)
 }
 
-const (
-	IntType    = "int"
-	LongType   = "long"
-	DoubleType = "double"
-)
+func buildIndexedFieldExpr(rootKey string, bsonType metadata.BsonType, op CompareOp, val any, placeholder *metadata.Placeholder) (string, []table.ParameterOption) {
+	params := make([]table.ParameterOption, 0)
 
-func isScalar(colType string) bool {
-	switch colType {
-	case IntType, LongType, DoubleType:
-		return true
-	default:
-		return false
-	}
-}
+	ydbValue := metadata.BsonValueToYdbValue(bsonType, val)
+	paramName := placeholder.Next()
+	params = append(params, table.ValueParam(paramName, ydbValue))
 
-func buildIndexedFieldExpr(rootKey, bsonType, paramName string, op CompareOp, val any) (string, table.ParameterOption) {
-	ydbValue := metadata.MapBSONValueToYDBValue(bsonType, val)
-	param := table.ValueParam(paramName, ydbValue)
-	isTargetIsScalar := isScalar(bsonType)
+	targetColumnSuffix := metadata.BsonTypeToColumnStore(bsonType)
+	targetColumn := fmt.Sprintf("%s_%s", rootKey, targetColumnSuffix)
 
-	scalarColumns := []string{
-		fmt.Sprintf("%s_%s", rootKey, LongType),
-		fmt.Sprintf("%s_%s", rootKey, IntType),
-		fmt.Sprintf("%s_%s", rootKey, DoubleType),
+	var conditions []string
+
+	if rootKey == metadata.IdMongoField && op == CompareOpEq {
+		bid, _ := sjson.MarshalSingleValue(val)
+		idHash := generateIdHash(bid, bsonType)
+
+		idParamName := placeholder.Next()
+		params = append(params, table.ValueParam(idParamName, ydbTypes.Uint64Value(idHash)))
+
+		conditions = append(conditions, fmt.Sprintf("%s%s%s", metadata.IdHashColumn, op, idParamName))
 	}
 
-	scalarSeparator := " OR "
-	var scalarGroupBuilder strings.Builder
-	for _, v := range scalarColumns {
-		if scalarGroupBuilder.Len() > 0 {
-			scalarGroupBuilder.WriteString(scalarSeparator)
-		}
-		if strings.Contains(v, DoubleType) {
-			scalarGroupBuilder.WriteString(fmt.Sprintf("%s %s CAST($%s AS Double)", v, op, paramName))
+	for _, colType := range metadata.ColumnOrder {
+		colName := fmt.Sprintf("%s_%s", rootKey, colType)
+		if colName == targetColumn {
+			conditions = append(conditions, fmt.Sprintf("%s %s %s", colName, op, paramName))
 		} else {
-			scalarGroupBuilder.WriteString(fmt.Sprintf("%s %s $%s", v, op, paramName))
-		}
-	}
-	scalarGroup := fmt.Sprintf("(%s)", scalarGroupBuilder.String())
-
-	columnsOrder := metadata.GetColumnsInDefinedOrder()
-
-	var sb strings.Builder
-	separator := " AND "
-
-	for _, colType := range columnsOrder {
-		column := fmt.Sprintf("%s_%s", rootKey, colType)
-
-		if colType == LongType && isTargetIsScalar {
-			sb.WriteString(scalarGroup)
-		}
-		if !isScalar(colType) || !isTargetIsScalar {
-			sb.WriteString(fmt.Sprintf("%s IS NULL", column))
-			sb.WriteString(separator)
+			conditions = append(conditions, fmt.Sprintf("%s IS NULL", colName))
 		}
 	}
 
-	q := sb.String()
+	q := strings.Join(conditions, " "+AndWord+" ")
 
-	if !isTargetIsScalar {
-		indexedColumn := fmt.Sprintf("%s_%s", rootKey, bsonType)
-		replacer := fmt.Sprintf("%s IS NULL", indexedColumn)
-		replacement := fmt.Sprintf("%s %s $%s", indexedColumn, op, paramName)
-		q = strings.Replace(q, replacer, replacement, 1)
-	}
-
-	q = strings.TrimSuffix(q, separator)
-
-	return q, param
+	return q, params
 }
 
-func getTypesForIndexSearch() map[string]struct{} {
-	return map[string]struct{}{
-		"string":   {},
-		"objectId": {},
-		"bool":     {},
-		"date":     {},
-		"long":     {},
-		"int":      {},
-	}
-}
-
-func isIndexableType(bsonType string) bool {
-	supportedTypes := getTypesForIndexSearch()
-	_, exists := supportedTypes[bsonType]
+func isIndexableType(bsonType metadata.BsonType) bool {
+	_, exists := metadata.IndexedBsonTypes[bsonType]
 
 	return exists
 }

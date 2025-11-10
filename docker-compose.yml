@@ -68,6 +68,27 @@ services:
       - MYSQL_USER=username
       - MYSQL_PASSWORD=password
       - MYSQL_DATABASE=ferretdb
+  
+  ydb:
+    build:
+      context: ./build/deps
+      dockerfile: ydb.Dockerfile
+    container_name: ferretdb_ydb
+    hostname: localhost
+    ports:
+      - "8765:8765" # HTTP monitoring port
+      - "2136:2136" # grpc
+      - "2135:2135" # grpcs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - YDB_USE_IN_MEMORY_PDISKS=true
+      - YDB_ENABLE_COLUMN_TABLES=true
+      - MON_PORT=8765
+      - GRPC_PORT=2136
+      - GRPC_TLS_PORT=2135
+    volumes:
+      - ./build/certs/ydb_certs:/ydb_certs
 
   mongodb:
     build:

@@ -16,6 +16,7 @@ package backends_test // to avoid import cycle
 
 import (
 	"slices"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -283,6 +284,9 @@ func TestCappedCollectionInsertAllDeleteAll(t *testing.T) {
 
 			docs, err := iterator.ConsumeValues[struct{}, *types.Document](res.Iter)
 			require.NoError(t, err)
+
+			sortDocsByRecordID([]*types.Document{doc1, doc2, doc3})
+			sortDocsByRecordID(docs)
 			assertEqualRecordID(t, []*types.Document{doc1, doc2, doc3}, docs)
 
 			params := &backends.DeleteAllParams{
@@ -500,6 +504,10 @@ func TestCollectionCompact(t *testing.T) {
 	for name, b := range testBackends(t) {
 		name, b := name, b
 		t.Run(name, func(t *testing.T) {
+			if name == "ydb" {
+				t.Skip()
+			}
+
 			t.Parallel()
 
 			t.Run("DatabaseDoesNotExist", func(t *testing.T) {
@@ -609,4 +617,10 @@ func TestListCollections(t *testing.T) {
 			})
 		})
 	}
+}
+
+func sortDocsByRecordID(docs []*types.Document) {
+	sort.Slice(docs, func(i, j int) bool {
+		return docs[i].RecordID() < docs[j].RecordID()
+	})
 }

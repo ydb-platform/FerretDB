@@ -163,6 +163,17 @@ var hanaFlags struct {
 	HANAURL string `name:"hana-url" help:"SAP HANA URL for 'hana' handler"`
 }
 
+// The ydbFlags struct represents flags that are used by the "ydb" backend.
+//
+// See main_ydb.go.
+//
+//nolint:lll // some tags are long
+var ydbFlags struct {
+	YdbURL      string `name:"ydb-url" default:"grpc://localhost:2136/local" help:"YDB URL for 'ydb' handler."`
+	YdbAuth     string `name:"ydb-auth" help:"YDB auth handler."`
+	YdbFilePath string `name:"ydb-file-path" help:"YDB CA path."`
+}
+
 // handlerFlags is a map of handler names to their flags.
 var handlerFlags = map[string]any{}
 
@@ -524,6 +535,10 @@ func run() {
 		HANAURL: hanaFlags.HANAURL,
 
 		MySQLURL: mySQLFlags.MySQLURL,
+
+		YdbURL:  ydbFlags.YdbURL,
+		YdbAuth: ydbFlags.YdbAuth,
+		YdbFile: ydbFlags.YdbFilePath,
 
 		TestOpts: registry.TestOpts{
 			DisablePushdown:         cli.Test.DisablePushdown,

@@ -1,0 +1,723 @@
+package ydb
+
+import (
+	"context"
+	"fmt"
+	"github.com/FerretDB/FerretDB/internal/backends"
+	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
+	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata/transaction"
+	"github.com/FerretDB/FerretDB/internal/types"
+	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
+	"github.com/FerretDB/FerretDB/internal/util/must"
+	"github.com/ydb-platform/ydb-go-sdk/v3"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/result"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/result/named"
+	ydbTypes "github.com/ydb-platform/ydb-go-sdk/v3/table/types"
+	"path"
+	"sort"
+	"strings"
+)
+
+const defaultRowsLimit = 1000
+
+// collection implements backends.Collection interface.
+type collection struct {
+	r      *metadata.Registry
+	dbName string
+	name   string
+}
+
+// newCollection creates a new Collection.
+func newCollection(r *metadata.Registry, dbName, name string) backends.Collection {
+	return backends.CollectionContract(&collection{
+		r:      r,
+		dbName: dbName,
+		name:   name,
+	})
+}
+
+// Query implements backends.Collection interface.
+func (c *collection) Query(ctx context.Context, params *backends.QueryParams) (*backends.QueryResult, error) {
+	db, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if db == nil {
+		return &backends.QueryResult{
+			Iter: NewQueryIterator(ctx, nil, params.OnlyRecordIDs),
+		}, nil
+	}
+
+	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if meta == nil {
+		return &backends.QueryResult{
+			Iter: NewQueryIterator(ctx, nil, params.OnlyRecordIDs),
+		}, nil
+	}
+
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	var builder strings.Builder
+	var p metadata.Placeholder
+	var args []table.ParameterOption
+
+	builder.WriteString(fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n", ydbPath))
+
+	selectClause := prepareSelectClause(&metadata.SelectParams{
+		Schema:        c.dbName,
+		Table:         meta.TableName,
+		Comment:       params.Comment,
+		Capped:        meta.Capped(),
+		OnlyRecordIDs: params.OnlyRecordIDs,
+	})
+
+	where, whereArgs, useIndex, err := prepareWhereClause(params.Filter, meta, &p)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+	args = append(args, whereArgs...)
+
+	limitParamName, limitArgs := prepareLimitClause(params, &p)
+	args = append(args, limitArgs)
+
+	orderByClause := prepareOrderByClause(params.Sort)
+
+	var declareParts []string
+	if len(args) > 0 {
+		declareParts = make([]string, len(args))
+		for i, param := range args {
+			paramName := param.Name()
+			paramValue := param.Value()
+			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;\n", paramName, paramValue.Type().String())
+		}
+	}
+
+	if len(declareParts) > 0 {
+		builder.WriteString(strings.Join(declareParts, ""))
+	}
+
+	builder.WriteString(selectClause)
+
+	if useIndex != nil {
+		if useIndex.idxName != nil {
+			builder.WriteString(fmt.Sprintf(" %s %s", ViewWord, *useIndex.idxName))
+		}
+	}
+
+	if len(whereArgs) > 0 {
+		builder.WriteString(fmt.Sprintf(" %s %s ", WhereWord, where))
+	}
+
+	builder.WriteString(orderByClause)
+
+	if limitArgs != nil {
+		builder.WriteString(fmt.Sprintf(" %s %s", LimitWord, limitParamName))
+	}
+
+	qp := table.NewQueryParameters(args...)
+	q := builder.String()
+	fmt.Println("query", q)
+
+	var res result.Result
+	err = c.r.D.Driver.Table().Do(ctx,
+		func(ctx context.Context, session table.Session) (err error) {
+			if err = ctx.Err(); err != nil {
+				return err
+			}
+
+			_, res, err = session.Execute(ctx, transaction.OnlineReadTx, q, qp)
+			if err != nil {
+				return err
+			}
+
+			err = res.NextResultSetErr(ctx)
+			if err != nil {
+				return err
+			}
+
+			return res.Err()
+		},
+		table.WithIdempotent(),
+	)
+
+	return &backends.QueryResult{
+		Iter: NewQueryIterator(ctx, res, params.OnlyRecordIDs),
+	}, nil
+}
+
+func (c *collection) Explain(ctx context.Context, params *backends.ExplainParams) (*backends.ExplainResult, error) {
+	db, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	if err != nil {
+		return &backends.ExplainResult{
+			QueryPlanner: must.NotFail(types.NewDocument()),
+		}, nil
+	}
+
+	if db == nil {
+		return &backends.ExplainResult{
+			QueryPlanner: must.NotFail(types.NewDocument()),
+		}, nil
+	}
+
+	meta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if meta == nil {
+		return &backends.ExplainResult{
+			QueryPlanner: must.NotFail(types.NewDocument()),
+		}, nil
+	}
+
+	res := new(backends.ExplainResult)
+
+	opts := &metadata.SelectParams{
+		Schema: c.dbName,
+		Table:  meta.TableName,
+		Capped: meta.Capped(),
+	}
+
+	var plan string
+
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	var builder strings.Builder
+	var p metadata.Placeholder
+
+	builder.WriteString(fmt.Sprintf("PRAGMA TablePathPrefix(\"%s\");\n", ydbPath))
+
+	selectClause := prepareSelectClause(opts)
+
+	where, args, useIndex, err := prepareWhereClause(params.Filter, meta, &p)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	res.FilterPushdown = where != ""
+
+	var declareParts []string
+	if len(args) > 0 {
+		declareParts = make([]string, len(args))
+		for i, param := range args {
+			paramName := param.Name()
+			paramValue := param.Value()
+			declareParts[i] = fmt.Sprintf("DECLARE %s AS %s;", paramName, paramValue.Type().String())
+		}
+	}
+
+	if len(declareParts) > 0 {
+		builder.WriteString(strings.Join(declareParts, "\n"))
+	}
+
+	builder.WriteString(selectClause)
+
+	if useIndex != nil {
+		if useIndex.idxName != nil {
+			builder.WriteString(fmt.Sprintf(" %s %s", ViewWord, *useIndex.idxName))
+		}
+	}
+
+	if len(args) > 0 {
+		builder.WriteString(fmt.Sprintf(" %s %s ", WhereWord, where))
+	}
+
+	orderByClause := prepareOrderByClause(params.Sort)
+	res.SortPushdown = orderByClause != ""
+
+	builder.WriteString(orderByClause)
+
+	if params.Limit != 0 {
+		builder.WriteString(fmt.Sprintf(" LIMIT %d", params.Limit))
+	} else {
+		builder.WriteString(fmt.Sprintf(" LIMIT %d", defaultRowsLimit))
+	}
+
+	res.LimitPushdown = true
+
+	q := builder.String()
+
+	err = c.r.D.Driver.Table().Do(
+		ctx,
+		func(ctx context.Context, s table.Session) (err error) {
+			explanation, err := s.Explain(ctx, q)
+			if err != nil {
+				return err
+			}
+
+			plan, _ = explanation.Plan, explanation.AST
+
+			return nil
+		},
+		table.WithIdempotent(),
+	)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	queryPlan, err := UnmarshalExplain(plan)
+	res.QueryPlanner = queryPlan
+
+	return res, nil
+}
+
+// InsertAll implements backends.Collection interface.
+func (c *collection) InsertAll(ctx context.Context, params *backends.InsertAllParams) (*backends.InsertAllResult, error) {
+	if _, err := c.r.CollectionCreate(ctx, &metadata.CollectionCreateParams{
+		DBName: c.dbName,
+		Name:   c.name,
+	}); err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	meta, err := c.r.CollectionGetCopy(c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	batchSize := c.r.BatchSize
+	if batchSize < 1 {
+		panic("batch-size should be greater or equal to 1")
+	}
+
+	docs := params.Docs
+	documentsData := make([]ydbTypes.Value, 0, len(docs))
+
+	var extraColumns map[string]metadata.IndexColumn
+	for len(docs) > 0 {
+		i := min(batchSize, len(docs))
+		batch, rest := docs[:i], docs[i:]
+
+		for _, doc := range batch {
+			extraColumns = metadata.ExtractIndexFields(doc, meta.Indexes)
+			documentsData = append(documentsData, singleDocumentData(doc, extraColumns, meta.Capped()))
+		}
+
+		docs = rest
+	}
+
+	q := buildInsertQuery(ydbPath, meta.TableName, meta.Capped(), extraColumns)
+
+	err = c.r.D.Driver.Table().Do(
+		ctx,
+		func(ctx context.Context, session table.Session) (err error) {
+			_, res, err := session.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
+				table.ValueParam("$insertData", ydbTypes.ListValue(documentsData...))),
+			)
+
+			if err != nil {
+				return err
+			}
+
+			if err = res.Err(); err != nil {
+				return err
+			}
+
+			return res.Close()
+		},
+	)
+
+	if err != nil {
+		if metadata.IsOperationErrorConflictExistingKey(err) {
+			return nil, backends.NewError(backends.ErrorCodeInsertDuplicateID, err)
+		}
+		return nil, lazyerrors.Error(err)
+	}
+
+	return new(backends.InsertAllResult), nil
+}
+
+// DeleteAll implements backends.Collection interface.
+func (c *collection) DeleteAll(ctx context.Context, params *backends.DeleteAllParams) (*backends.DeleteAllResult, error) {
+	dbMeta, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	switch {
+	case err != nil:
+		return nil, lazyerrors.Error(err)
+	case dbMeta == nil:
+		return &backends.DeleteAllResult{Deleted: 0}, nil
+	}
+
+	colMeta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	switch {
+	case err != nil:
+		return nil, lazyerrors.Error(err)
+	case colMeta == nil:
+		return &backends.DeleteAllResult{Deleted: 0}, nil
+	}
+
+	ids := prepareIds(params)
+	fmt.Println("ids to dleete", ids)
+	fmt.Println("params", params.RecordIDs, params.IDs)
+
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	var primaryKeyColumns = metadata.BuildPrimaryKeyColumns()
+	primaryKeyColumnNames := make([]string, len(primaryKeyColumns))
+
+	for i := range primaryKeyColumns {
+		primaryKeyColumnNames[i] = primaryKeyColumns[i].Name
+	}
+
+	config := metadata.NewDeleteConfig(ydbPath, colMeta.TableName, primaryKeyColumnNames, params)
+
+	q, err := metadata.Render(metadata.DeleteTmpl, config)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	fmt.Println("delete", q)
+
+	var p *metadata.Placeholder
+
+	var deletedCount uint64
+
+	err = c.r.D.Driver.Table().Do(
+		ctx,
+		func(ctx context.Context, session table.Session) (err error) {
+			_, res, err := session.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
+				table.ValueParam(p.Named("IDs"), ydbTypes.ListValue(ids...)),
+			))
+
+			if err != nil {
+				return err
+			}
+
+			if err = res.Err(); err != nil {
+				return err
+			}
+
+			err = res.NextResultSetErr(ctx)
+			if err != nil {
+				return err
+			}
+
+			for res.NextRow() {
+				err = res.ScanNamed(
+					named.OptionalWithDefault("deleted_count", &deletedCount),
+				)
+				if err != nil {
+					return lazyerrors.Error(err)
+				}
+			}
+
+			return res.Close()
+
+		},
+	)
+
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	return &backends.DeleteAllResult{Deleted: int32(deletedCount)}, nil
+}
+
+func (c *collection) UpdateAll(ctx context.Context, params *backends.UpdateAllParams) (*backends.UpdateAllResult, error) {
+	dbMeta, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	switch {
+	case err != nil:
+		return nil, lazyerrors.Error(err)
+	case dbMeta == nil:
+		return &backends.UpdateAllResult{}, nil
+	}
+
+	colMeta, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	switch {
+	case err != nil:
+		return nil, lazyerrors.Error(err)
+	case colMeta == nil:
+		return &backends.UpdateAllResult{}, nil
+	}
+
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	docs := params.Docs
+	documentsData := make([]ydbTypes.Value, 0, len(docs))
+
+	extraColumns := make(map[string]metadata.IndexColumn)
+	for _, doc := range docs {
+		extraColumns = metadata.ExtractIndexFields(doc, colMeta.Indexes)
+		documentsData = append(documentsData, singleDocumentData(doc, extraColumns, colMeta.Capped()))
+	}
+
+	q := buildUpsertQuery(ydbPath, colMeta.TableName, extraColumns)
+
+	fmt.Println("upsert", q)
+	err = c.r.D.Driver.Table().Do(
+		ctx,
+		func(ctx context.Context, session table.Session) (err error) {
+			_, res, err := session.Execute(ctx, transaction.WriteTx, q, table.NewQueryParameters(
+				table.ValueParam("$insertData", ydbTypes.ListValue(documentsData...))),
+			)
+			if err != nil {
+				return err
+			}
+			if err = res.Err(); err != nil {
+				return err
+			}
+
+			return res.Close()
+		},
+		table.WithIdempotent(),
+	)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	return new(backends.UpdateAllResult), nil
+}
+
+// Stats implements backends.Collection interface.
+func (c *collection) Stats(ctx context.Context, params *backends.CollectionStatsParams) (*backends.CollectionStatsResult, error) {
+	p, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if p == nil {
+		return nil, backends.NewError(
+			backends.ErrorCodeCollectionDoesNotExist,
+			lazyerrors.Errorf("no ns %s.%s", c.dbName, c.name),
+		)
+	}
+
+	coll, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if coll == nil {
+		return nil, backends.NewError(
+			backends.ErrorCodeCollectionDoesNotExist,
+			lazyerrors.Errorf("no ns %s.%s", c.dbName, c.name),
+		)
+	}
+
+	c.r.Rw.RLock()
+	ydbPath := c.r.DbMapping[c.dbName]
+	c.r.Rw.RUnlock()
+
+	stats, err := collectionsStats(ctx, c.r.D.Driver, ydbPath, []*metadata.Collection{coll}, params.Refresh)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	indexSizes := make([]backends.IndexSize, len(coll.Indexes))
+	for i, index := range coll.Indexes {
+		indexSizes[i] = backends.IndexSize{
+			Name: index.Name,
+			Size: 0,
+		}
+	}
+
+	return &backends.CollectionStatsResult{
+		CountDocuments:  stats.countDocuments,
+		SizeTotal:       stats.sizeTables,
+		SizeIndexes:     stats.sizeIndexes,
+		SizeCollection:  stats.sizeTables,
+		SizeFreeStorage: stats.sizeFreeStorage,
+		IndexSizes:      indexSizes,
+	}, nil
+}
+
+func collectionsStats(ctx context.Context, driver *ydb.Driver, ydbPath string, list []*metadata.Collection, refresh bool) (*stats, error) {
+	if len(list) == 0 {
+		return new(stats), nil
+	}
+
+	var (
+		sizeTables      uint64
+		countDocuments  uint64
+		sizeIndexes     uint64
+		sizeFreeStorage uint64
+	)
+
+	for _, coll := range list {
+		tablePath := path.Join(ydbPath, coll.TableName)
+		err := driver.Table().Do(ctx,
+			func(ctx context.Context, s table.Session) error {
+				q := `
+				DECLARE $tablePath AS Utf8;
+
+				SELECT
+					stats.TableSize,
+					stats.IndexesSize,
+					stats.RowCount,
+					storage.CurrentAvailableSize
+				FROM (
+					SELECT
+						SUM(CASE WHEN Path = $tablePath THEN DataSize ELSE 0 END) AS TableSize,
+						SUM(CASE WHEN Path LIKE $tablePath || '/%%/indexImplTable' THEN DataSize ELSE 0 END) AS IndexesSize,
+						SUM(CASE WHEN Path = $tablePath THEN RowCount ELSE 0 END) AS RowCount
+					FROM ` + "`.sys/partition_stats`" + `
+					WHERE Path = $tablePath OR Path LIKE $tablePath || '/%%/indexImplTable'
+				) AS stats
+				CROSS JOIN (
+					SELECT SUM(CurrentAvailableSize) AS CurrentAvailableSize 
+    				FROM ` + "`.sys/ds_storage_stats`" + `
+				) AS storage;`
+				_, res, err := s.Execute(ctx, transaction.OnlineReadTx, q,
+					table.NewQueryParameters(table.ValueParam("$tablePath", ydbTypes.UTF8Value(tablePath))),
+				)
+
+				if err != nil {
+					return err
+				}
+				defer func() {
+					_ = res.Close()
+				}()
+
+				err = res.NextResultSetErr(ctx)
+				if err != nil {
+					return err
+				}
+
+				for res.NextRow() {
+					if err = res.ScanNamed(
+						named.OptionalWithDefault("stats.TableSize", &sizeTables),
+						named.OptionalWithDefault("stats.IndexesSize", &sizeIndexes),
+						named.OptionalWithDefault("stats.RowCount", &countDocuments),
+						named.OptionalWithDefault("storage.CurrentAvailableSize", &sizeFreeStorage),
+					); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			})
+
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+	}
+
+	return &stats{
+		countDocuments:  int64(countDocuments),
+		sizeIndexes:     int64(sizeIndexes),
+		sizeTables:      int64(sizeTables),
+		sizeFreeStorage: int64(sizeFreeStorage),
+	}, nil
+}
+
+// ListIndexes implements backends.Collection interface.
+func (c *collection) ListIndexes(ctx context.Context, params *backends.ListIndexesParams) (*backends.ListIndexesResult, error) {
+	db, err := c.r.DatabaseGetExisting(ctx, c.dbName)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	if db == nil {
+		return nil, backends.NewError(
+			backends.ErrorCodeCollectionDoesNotExist,
+			lazyerrors.Errorf("no ns %s.%s", c.dbName, c.name),
+		)
+	}
+
+	coll, err := c.r.CollectionGet(ctx, c.dbName, c.name)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+	if coll == nil {
+		return nil, backends.NewError(
+			backends.ErrorCodeCollectionDoesNotExist,
+			lazyerrors.Errorf("no ns %s.%s", c.dbName, c.name),
+		)
+	}
+
+	res := backends.ListIndexesResult{
+		Indexes: make([]backends.IndexInfo, len(coll.Indexes)),
+	}
+
+	for i, index := range coll.Indexes {
+		res.Indexes[i] = backends.IndexInfo{
+			Name:   index.Name,
+			Unique: index.Unique,
+			Key:    make([]backends.IndexKeyPair, len(index.Key)),
+		}
+
+		for j, key := range index.Key {
+			res.Indexes[i].Key[j] = backends.IndexKeyPair{
+				Field:      key.Field,
+				Descending: key.Descending,
+			}
+		}
+	}
+
+	sort.Slice(res.Indexes, func(i, j int) bool {
+		return res.Indexes[i].Name < res.Indexes[j].Name
+	})
+
+	return &res, nil
+}
+
+// CreateIndexes implements backends.Collection interface.
+func (c *collection) CreateIndexes(ctx context.Context, params *backends.CreateIndexesParams) (*backends.CreateIndexesResult, error) { //nolint:lll // for readability
+	indexes := make([]metadata.IndexInfo, len(params.Indexes))
+	for i, index := range params.Indexes {
+		indexes[i] = metadata.IndexInfo{
+			Name:   index.Name,
+			Key:    make([]metadata.IndexKeyPair, len(index.Key)),
+			Unique: index.Unique,
+		}
+
+		for j, key := range index.Key {
+			indexes[i].Key[j] = metadata.IndexKeyPair{
+				Field:      key.Field,
+				Descending: key.Descending,
+			}
+		}
+	}
+
+	err := c.r.IndexesCreate(ctx, c.dbName, c.name, indexes)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	return new(backends.CreateIndexesResult), nil
+}
+
+// DropIndexes implements backends.Collection interface.
+func (c *collection) DropIndexes(ctx context.Context, params *backends.DropIndexesParams) (*backends.DropIndexesResult, error) {
+	err := c.r.IndexesDrop(ctx, c.dbName, c.name, params.Indexes)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	return new(backends.DropIndexesResult), nil
+}
+
+// Compact implements backends.Collection interface.
+func (c *collection) Compact(ctx context.Context, params *backends.CompactParams) (*backends.CompactResult, error) {
+	return new(backends.CompactResult), nil
+}
+
+// check interfaces
+var (
+	_ backends.Collection = (*collection)(nil)
+)
+
+// stats represents information about statistics of tables and indexes.
+type stats struct {
+	countDocuments  int64
+	sizeIndexes     int64
+	sizeTables      int64
+	sizeFreeStorage int64
+}

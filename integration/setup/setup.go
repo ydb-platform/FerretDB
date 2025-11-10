@@ -50,6 +50,7 @@ var (
 	sqliteURLF     = flag.String("sqlite-url", "", "in-process FerretDB: SQLite URI for 'sqlite' handler.")
 	mysqlURLF      = flag.String("mysql-url", "", "in-process FerretDB: MySQL URL for 'mysql' handler.")
 	hanaURLF       = flag.String("hana-url", "", "in-process FerretDB: Hana URL for 'hana' handler.")
+	ydbURLF        = flag.String("ydb-url", "", "in-process FerretDB: YDB URL for 'ydb' handler.")
 
 	batchSizeF = flag.Int("batch-size", 100, "maximum insertion batch size")
 
@@ -66,7 +67,7 @@ var (
 
 // Other globals.
 var (
-	allBackends = []string{"ferretdb-postgresql", "ferretdb-sqlite", "ferretdb-mysql", "ferretdb-hana", "mongodb"}
+	allBackends = []string{"ferretdb-postgresql", "ferretdb-sqlite", "ferretdb-mysql", "ferretdb-hana", "ferretdb-ydb", "mongodb"}
 )
 
 // SetupOpts represents setup options.

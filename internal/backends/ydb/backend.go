@@ -1,0 +1,175 @@
+package ydb
+
+import (
+	"cmp"
+	"context"
+	"log/slog"
+	"slices"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/FerretDB/FerretDB/internal/backends"
+	"github.com/FerretDB/FerretDB/internal/backends/ydb/metadata"
+	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
+	"github.com/FerretDB/FerretDB/internal/util/state"
+)
+
+// backend implements backends.Backend interface.
+type backend struct {
+	r *metadata.Registry
+}
+
+// NewBackendParams represents the parameters of NewBackend function.
+//
+//nolint:vet // for readability
+type NewBackendParams struct {
+	URI       string
+	Auth      string
+	AuthFile  string
+	L         *slog.Logger
+	P         *state.Provider
+	BatchSize int
+	_         struct{} // prevent unkeyed literals
+}
+
+// NewBackend creates a new Backend.
+func NewBackend(params *NewBackendParams) (backends.Backend, error) {
+	r, err := metadata.NewRegistry(params.URI, params.Auth, params.AuthFile, params.BatchSize, params.L, params.P)
+	if err != nil {
+		return nil, err
+	}
+
+	return backends.BackendContract(&backend{
+		r: r,
+	}), nil
+}
+
+// Database implements backends.Backend interface.
+func (b *backend) Database(name string) (backends.Database, error) {
+	return newDatabase(b.r, name), nil
+}
+
+// Close implements backends.Backend interface.
+func (b *backend) Close() {
+	b.r.Close()
+}
+
+// Status implements backends.Backend interface.
+func (b *backend) Status(ctx context.Context, params *backends.StatusParams) (*backends.StatusResult, error) {
+	dbs, err := b.r.DatabaseList(ctx, "")
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	var res backends.StatusResult
+
+	var pingSucceeded bool
+
+	for _, dbName := range dbs {
+		var cs []*metadata.Collection
+
+		if cs, err = b.r.CollectionList(ctx, dbName); err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		res.CountCollections += int64(len(cs))
+
+		colls, err := newDatabase(b.r, dbName).ListCollections(ctx, new(backends.ListCollectionsParams))
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		for _, cInfo := range colls.Collections {
+			if cInfo.Capped() {
+				res.CountCappedCollections++
+			}
+		}
+
+		if pingSucceeded {
+			continue
+		}
+
+		p, err := b.r.DatabaseGetExisting(ctx, dbName)
+		if err != nil {
+			return nil, lazyerrors.Error(err)
+		}
+
+		if p == nil {
+			continue
+		}
+
+		pingSucceeded = true
+	}
+
+	return &res, nil
+}
+
+// ListDatabases implements backends.Backend interface.
+//
+//nolint:lll // for readability
+func (b *backend) ListDatabases(ctx context.Context, params *backends.ListDatabasesParams) (*backends.ListDatabasesResult, error) {
+	var dbName string
+	if params != nil {
+		dbName = params.Name
+	}
+	list, err := b.r.DatabaseList(ctx, dbName)
+	if err != nil {
+		return nil, err
+	}
+
+	var res *backends.ListDatabasesResult
+
+	if params != nil && len(params.Name) > 0 {
+		i, found := slices.BinarySearchFunc(list, params.Name, func(dbName, t string) int {
+			return cmp.Compare(dbName, t)
+		})
+
+		var filteredList []string
+
+		if found {
+			filteredList = append(filteredList, list[i])
+		}
+
+		list = filteredList
+	}
+
+	res = &backends.ListDatabasesResult{
+		Databases: make([]backends.DatabaseInfo, 0, len(list)),
+	}
+
+	for _, dbName := range list {
+		res.Databases = append(res.Databases, backends.DatabaseInfo{
+			Name: dbName,
+		})
+	}
+	return res, nil
+}
+
+// DropDatabase implements backends.Backend interface.
+func (b *backend) DropDatabase(ctx context.Context, params *backends.DropDatabaseParams) error {
+	dropped, err := b.r.DatabaseDrop(ctx, params.Name)
+	if err != nil {
+		return lazyerrors.Error(err)
+	}
+
+	if !dropped {
+		return backends.NewError(backends.ErrorCodeDatabaseDoesNotExist, nil)
+	}
+
+	return nil
+}
+
+// Describe implements prometheus.Collector.
+func (b *backend) Describe(ch chan<- *prometheus.Desc) {
+	b.r.Describe(ch)
+}
+
+// Collect implements prometheus.Collector.
+func (b *backend) Collect(ch chan<- prometheus.Metric) {
+	b.r.Collect(ch)
+}
+
+// check interfaces
+var (
+	_ backends.Backend = (*backend)(nil)
+)

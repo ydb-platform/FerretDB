@@ -160,6 +160,7 @@ func (h *Handler) MsgFind(connCtx context.Context, msg *wire.OpMsg) (*wire.OpMsg
 
 	cursorID := c.ID
 
+	// TODO: this is extremely time and memory consuming operation (can be up to 50 milliseconds), need to explore and optimize code
 	docs, err := iterator.ConsumeValuesN(c, int(params.BatchSize))
 	if err != nil {
 		return nil, handleMaxTimeMSError(err, params.MaxTimeMS, "find")

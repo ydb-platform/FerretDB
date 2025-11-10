@@ -26,6 +26,7 @@ import (
 	"github.com/FerretDB/FerretDB/internal/backends/hana"
 	"github.com/FerretDB/FerretDB/internal/backends/postgresql"
 	"github.com/FerretDB/FerretDB/internal/backends/sqlite"
+	"github.com/FerretDB/FerretDB/internal/backends/ydb"
 	"github.com/FerretDB/FerretDB/internal/util/logging"
 	"github.com/FerretDB/FerretDB/internal/util/state"
 	"github.com/FerretDB/FerretDB/internal/util/testutil"
@@ -82,6 +83,25 @@ func testBackends(t *testing.T) map[string]*testBackend {
 		t.Cleanup(b.Close)
 
 		res["sqlite"] = &testBackend{
+			Backend: b,
+			sp:      sp,
+		}
+	}
+
+	{
+		sp, err := state.NewProvider("")
+		require.NoError(t, err)
+
+		b, err := ydb.NewBackend(&ydb.NewBackendParams{
+			URI:       testutil.TestBaseYdbURI(t, ""),
+			L:         logging.WithName(l, "ydb"),
+			P:         sp,
+			BatchSize: 1000,
+		})
+		require.NoError(t, err)
+		t.Cleanup(b.Close)
+
+		res["ydb"] = &testBackend{
 			Backend: b,
 			sp:      sp,
 		}

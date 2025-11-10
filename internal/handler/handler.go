@@ -311,7 +311,7 @@ func (h *Handler) cleanupAllCappedCollections(ctx context.Context) error {
 	connInfo.SetBypassBackendAuth()
 	ctx = conninfo.Ctx(ctx, connInfo)
 
-	dbList, err := h.b.ListDatabases(ctx, nil)
+	dbList, err := h.b.ListDatabases(ctx, &backends.ListDatabasesParams{Name: h.SetupDatabase})
 	if err != nil {
 		return lazyerrors.Error(err)
 	}

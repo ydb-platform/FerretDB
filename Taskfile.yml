@@ -15,7 +15,7 @@ vars:
   TESTJS_PORT: 27017
   RACE_FLAG: -race={{and (ne OS "windows") (ne ARCH "arm") (ne ARCH "riscv64")}}
   BUILD_TAGS: ferretdb_debug,ferretdb_hana
-  SERVICES: postgres postgres_secured mysql mongodb mongodb_secured jaeger
+  SERVICES: postgres postgres_secured mysql mongodb mongodb_secured jaeger ydb
 
 tasks:
   # invoked when `task` is run without arguments
@@ -352,6 +352,36 @@ tasks:
         --mode=diff-normal
         --handler=sqlite
         --sqlite-url=file:tmp/sqlite/
+        --test-records-dir=tmp/records
+
+  run-ydb:
+    desc: "Run FerretDB with `ydb` backend"
+    deps: [ build-host ]
+    cmds:
+      - >
+        bin/ferretdb{{exeExt}}
+        --listen-addr=:27017
+        --proxy-addr=127.0.0.1:47017
+        --mode=diff-normal
+        --repl-set-name=rs0
+        --handler=ydb
+        --ydb-url='grpc://localhost:2136?database=/local'
+        --test-records-dir=tmp/records
+
+  run-ydb-secured:
+    desc: "Run FerretDB with `ydb` backend secured"
+    deps: [build-host]
+    cmds:
+      - >
+        bin/ferretdb{{exeExt}}
+        --listen-addr=:27017
+        --proxy-addr=127.0.0.1:47017
+        --mode=diff-normal
+        --repl-set-name=rs0
+        --handler=ydb
+        --ydb-url='grpcs://username:password@localhost:2135?database=/local'
+        --ydb-auth='static'
+        --ydb-file-path='./build/certs/ydb_certs/ca.pem'
         --test-records-dir=tmp/records
 
   run-mysql:

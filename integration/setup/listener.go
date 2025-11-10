@@ -116,6 +116,7 @@ func setupListener(tb testtb.TB, ctx context.Context, logger *slog.Logger, opts 
 		require.Empty(tb, *sqliteURLF, "-sqlite-url must be empty for %q", *targetBackendF)
 		require.Empty(tb, *mysqlURLF, "-mysql-url must be empty for %q", *targetBackendF)
 		require.Empty(tb, *hanaURLF, "-hana-url must be empty for %q", *targetBackendF)
+		require.Empty(tb, *ydbURLF, "-ydb-url must be empty for %q", *targetBackendF)
 		handler = "postgresql"
 
 	case "ferretdb-sqlite":
@@ -123,13 +124,15 @@ func setupListener(tb testtb.TB, ctx context.Context, logger *slog.Logger, opts 
 		require.NotEmpty(tb, *sqliteURLF, "-sqlite-url must be set for %q", *targetBackendF)
 		require.Empty(tb, *mysqlURLF, "-mysql-url must be empty for %q", *targetBackendF)
 		require.Empty(tb, *hanaURLF, "-hana-url must be empty for %q", *targetBackendF)
+		require.Empty(tb, *ydbURLF, "-ydb-url must be empty for %q", *targetBackendF)
 		handler = "sqlite"
 
 	case "ferretdb-mysql":
 		require.Empty(tb, *postgreSQLURLF, "-postgresql-url must be empty for %q", *targetBackendF)
 		require.Empty(tb, *sqliteURLF, "-sqlite-url must be empty for %q", *targetBackendF)
-		require.NotEmpty(tb, *mysqlURLF, "-mysql-url must be empty for %q", *targetBackendF)
-		require.Empty(tb, *hanaURLF, "-hana-url must be set for %q", *targetBackendF)
+		require.NotEmpty(tb, *mysqlURLF, "-mysql-url must be set for %q", *targetBackendF)
+		require.Empty(tb, *hanaURLF, "-hana-url must be empty for %q", *targetBackendF)
+		require.Empty(tb, *ydbURLF, "-ydb-url must be empty for %q", *targetBackendF)
 		handler = "mysql"
 
 	case "ferretdb-hana":
@@ -137,7 +140,16 @@ func setupListener(tb testtb.TB, ctx context.Context, logger *slog.Logger, opts 
 		require.Empty(tb, *sqliteURLF, "-sqlite-url must be empty for %q", *targetBackendF)
 		require.Empty(tb, *mysqlURLF, "-mysql-url must be empty for %q", *targetBackendF)
 		require.NotEmpty(tb, *hanaURLF, "-hana-url must be set for %q", *targetBackendF)
+		require.Empty(tb, *ydbURLF, "-ydb-url must be empty for %q", *targetBackendF)
 		handler = "hana"
+
+	case "ferretdb-ydb":
+		require.Empty(tb, *postgreSQLURLF, "-postgresql-url must be empty for %q", *targetBackendF)
+		require.Empty(tb, *sqliteURLF, "-sqlite-url must be empty for %q", *targetBackendF)
+		require.Empty(tb, *mysqlURLF, "-mysql-url must be empty for %q", *targetBackendF)
+		require.Empty(tb, *hanaURLF, "-hana-url must be empty for %q", *targetBackendF)
+		require.NotEmpty(tb, *ydbURLF, "-ydb-url must be set for %q", *targetBackendF)
+		handler = "ydb"
 
 	case "mongodb":
 		tb.Fatal("can't start in-process MongoDB")
@@ -167,6 +179,12 @@ func setupListener(tb testtb.TB, ctx context.Context, logger *slog.Logger, opts 
 		mysqlURL = testutil.TestMySQLURI(tb, ctx, mysqlURL)
 	}
 
+	// use per-test YDB database to prevent problems with parallel tests
+	ydbURL := *ydbURLF
+	if ydbURL != "" {
+		ydbURL = testutil.TestBaseYdbURI(tb, ydbURL)
+	}
+
 	sp, err := state.NewProvider("")
 	require.NoError(tb, err)
 
@@ -183,6 +201,7 @@ func setupListener(tb testtb.TB, ctx context.Context, logger *slog.Logger, opts 
 		SQLiteURL:     sqliteURL,
 		MySQLURL:      mysqlURL,
 		HANAURL:       *hanaURLF,
+		YdbURL:        ydbURL,
 
 		TestOpts: registry.TestOpts{
 			DisablePushdown:         *disablePushdownF,
